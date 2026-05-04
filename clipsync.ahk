@@ -120,6 +120,7 @@ PullFiles() {
 ; ============================================================================
 PushToLocal() {
     Send "^c"
+    Tip("Checking REMOTE clipboard...")
     Sleep 300
     kind := MyClipboardKind()
     if (kind = "empty") {

@@ -85,6 +85,18 @@ function Write-Response($stream, [string]$status, [string]$body) {
     $stream.Flush()
 }
 
+$pruneDays = 7
+$stagingDir = Join-Path $env:LOCALAPPDATA 'clipsync\incoming'
+if (Test-Path $stagingDir) {
+    $cutoff = (Get-Date).AddDays(-$pruneDays)
+    Get-ChildItem -Path $stagingDir -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt $cutoff } |
+        ForEach-Object {
+            try { Remove-Item $_.FullName -Recurse -Force; Log "pruned $($_.FullName)" }
+            catch { Log "prune failed: $($_.FullName) - $($_.Exception.Message)" }
+        }
+}
+
 $ip = [Net.IPAddress]::Parse($Bind)
 $listener = New-Object Net.Sockets.TcpListener($ip, $Port)
 try {
