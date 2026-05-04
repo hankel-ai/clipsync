@@ -2,28 +2,40 @@
 #SingleInstance Force
 
 ; ----------------------------------------------------------------------------
-; clipsync.ahk - Two-way clipboard + file sync between REMOTE (this machine)
-; and LOCAL over outbound SSH. Runs on REMOTE only.
+; clipsync.ahk - REMOTE-side hotkey driver.
 ;
 ;   Ctrl+Alt+Win+V  ->  pull LOCAL's clipboard onto REMOTE
 ;   Ctrl+Alt+Win+C  ->  push REMOTE's clipboard onto LOCAL
 ;
-; Handles text and Explorer file/folder selections (CF_HDROP).
-; Text is shipped via a UTF-8 temp file over scp (no encoding/quoting drama).
+; Architecture:
+;   - LOCAL runs clipsync-bridge.ps1 in its interactive logon session
+;     (so it can actually access the user's clipboard). It listens on
+;     127.0.0.1:8765 with HTTP-style endpoints.
+;   - REMOTE talks to that bridge via:  ssh local "curl http://127.0.0.1:8765/..."
+;     The SSH session itself can't see the clipboard, but it can dial
+;     localhost on LOCAL, and the bridge (which IS in the desktop session)
+;     handles the actual clipboard read/write.
+;   - File payloads still go directly over scp; only clipboard read/write
+;     uses the bridge.
+;
+; REMOTE-side clipboard ops (this script's own clipboard) are done locally
+; through PowerShell or AHK directly - no bridge needed because AHK runs
+; in REMOTE's interactive session and CAN see its own clipboard.
 ; ----------------------------------------------------------------------------
 
 ; --- Configuration ----------------------------------------------------------
-SSH_HOST     := "clipsync-local"                              ; ssh config alias
-STAGING_BASE := EnvGet("LOCALAPPDATA") "\clipsync\incoming"   ; on REMOTE
-LOG_PATH     := EnvGet("LOCALAPPDATA") "\clipsync\clipsync.log"
-PRUNE_DAYS   := 7
-TRAY_MS      := 2500
-
-; PowerShell prefix that pins UTF-8 in/out so Unicode survives the SSH pipe.
-PS_UTF8 := "[Console]::OutputEncoding=[Text.Encoding]::UTF8;[Console]::InputEncoding=[Text.Encoding]::UTF8;"
+SSH_HOST       := "clipsync-local"                              ; ssh config alias
+BRIDGE_URL     := "http://127.0.0.1:8765"                       ; bridge on LOCAL loopback
+STAGING_BASE   := EnvGet("LOCALAPPDATA") "\clipsync\incoming"   ; on REMOTE
+LOG_PATH       := EnvGet("LOCALAPPDATA") "\clipsync\clipsync.log"
+PRUNE_DAYS     := 7
+TRAY_MS        := 2500
+HTTP_TIMEOUT_S := 15
+PS_UTF8        := "[Console]::OutputEncoding=[Text.Encoding]::UTF8;[Console]::InputEncoding=[Text.Encoding]::UTF8;"
 
 DirCreate(STAGING_BASE)
 PruneOldStaging()
+Log("=== clipsync started ===")
 
 ; --- Hotkeys ----------------------------------------------------------------
 ^!#v::PullFromLocal()
@@ -34,7 +46,12 @@ PruneOldStaging()
 ; ============================================================================
 PullFromLocal() {
     Tip("Checking LOCAL clipboard...")
-    kind := RemoteClipboardKind()
+    res := SshGet("/kind")
+    if (res.exitCode != 0) {
+        Tip("Bridge unreachable: " Trim(res.stderr), true)
+        return
+    }
+    kind := Trim(res.stdout, "`r`n `t")
     if (kind = "empty") {
         Tip("LOCAL clipboard is empty.", true)
         return
@@ -44,36 +61,28 @@ PullFromLocal() {
     else if (kind = "files")
         PullFiles()
     else
-        Tip("Could not read LOCAL clipboard: " kind, true)
+        Tip("Bridge returned unknown kind: " kind, true)
 }
 
 PullText() {
-    ps := PS_UTF8 "Get-Clipboard -Raw"
-    res := SshPs(ps)
+    res := SshGet("/text")
     if (res.exitCode != 0) {
-        Tip("SSH failed: " Trim(res.stderr), true)
+        Tip("GET /text failed: " Trim(res.stderr), true)
         return
     }
-    text := res.stdout
-    ; SSH/PS often appends a CRLF. Trim a single trailing newline.
-    if (SubStr(text, -1) = "`n")
-        text := SubStr(text, 1, -1)
-    if (SubStr(text, -1) = "`r")
-        text := SubStr(text, 1, -1)
-    A_Clipboard := text
-    Tip("Pulled " StrLen(text) " chars from LOCAL.")
+    A_Clipboard := res.stdout
+    Tip("Pulled " StrLen(res.stdout) " chars from LOCAL.")
 }
 
 PullFiles() {
-    ps := PS_UTF8 "(Get-Clipboard -Format FileDropList).FullName"
-    res := SshPs(ps)
+    res := SshGet("/files")
     if (res.exitCode != 0) {
-        Tip("SSH failed: " Trim(res.stderr), true)
+        Tip("GET /files failed: " Trim(res.stderr), true)
         return
     }
     paths := SplitLines(res.stdout)
     if (paths.Length = 0) {
-        Tip("LOCAL had no file paths.", true)
+        Tip("Bridge returned no file paths.", true)
         return
     }
 
@@ -87,7 +96,7 @@ PullFiles() {
             ok++
         else {
             fail++
-            OutputDebug("scp pull failed for " path ": " scp.stderr "`n")
+            Log("scp pull failed for " path ": " scp.stderr)
         }
     }
     if (ok = 0) {
@@ -98,7 +107,7 @@ PullFiles() {
     staged := []
     for f in DirItems(stage)
         staged.Push(f)
-    SetClipboardFiles(staged)
+    SetLocalClipboardFiles(staged)
     Tip("Pulled " ok " item(s) from LOCAL" (fail ? " (" fail " failed)" : "") ".")
 }
 
@@ -106,7 +115,7 @@ PullFiles() {
 ;  Direction 2: REMOTE -> LOCAL
 ; ============================================================================
 PushToLocal() {
-    kind := LocalClipboardKind()
+    kind := MyClipboardKind()
     if (kind = "empty") {
         Tip("REMOTE clipboard is empty.", true)
         return
@@ -121,48 +130,27 @@ PushToLocal() {
 
 PushText() {
     text := A_Clipboard
-
-    ; Resolve LOCAL %TEMP% so we have an absolute path to scp into.
-    res := SshPs(PS_UTF8 "$env:TEMP")
-    if (res.exitCode != 0) {
-        Tip("SSH failed: " Trim(res.stderr), true)
-        return
-    }
-    localTemp := Trim(res.stdout, "`r`n `t")
-    if (localTemp = "") {
-        Tip("LOCAL %TEMP% was empty.", true)
-        return
-    }
-    target := localTemp "\clipsync_text_" A_TickCount ".txt"
-
-    ; Write clipboard to a UTF-8 temp file and scp it up
-    tmp := A_Temp "\clipsync_text_" A_TickCount ".txt"
-    FileAppend(text, tmp, "UTF-8-RAW")  ; no BOM; raw bytes
-    scp := Run2('scp -q "' tmp '" ' SSH_HOST ':"' target '"')
+    ; Write the text to a UTF-8 temp file on REMOTE, scp it up, POST to bridge.
+    tmp := A_Temp "\clipsync_pushtext_" A_TickCount ".txt"
+    FileAppend(text, tmp, "UTF-8-RAW")
+    res := ScpThenPost(tmp, "/text")
     try FileDelete(tmp)
-    if (scp.exitCode != 0) {
-        Tip("scp push failed: " Trim(scp.stderr), true)
-        return
-    }
-
-    ; On LOCAL: read the file as UTF-8, set clipboard, delete the file
-    ps := PS_UTF8 . "Set-Clipboard ([IO.File]::ReadAllText('" target "',[Text.Encoding]::UTF8));Remove-Item -LiteralPath '" target "' -Force"
-    res2 := SshPs(ps)
-    if (res2.exitCode != 0) {
-        Tip("Set-Clipboard failed: " Trim(res2.stderr), true)
+    if (res.exitCode != 0 || !ResponseOk(res)) {
+        Tip("Push text failed: " Trim(res.stderr) " " Trim(res.stdout), true)
         return
     }
     Tip("Pushed " StrLen(text) " chars to LOCAL.")
 }
 
 PushFiles() {
-    paths := GetClipboardFiles()
+    paths := MyClipboardFiles()
     if (paths.Length = 0) {
         Tip("No files on REMOTE clipboard.", true)
         return
     }
 
-    ; Make a timestamped staging dir on LOCAL and get its absolute path back
+    ; Make a timestamped staging dir on LOCAL via plain SSH (filesystem ops
+    ; don't need the interactive session).
     ts := FormatTime(, "yyyyMMdd-HHmmss")
     mkdirPs := PS_UTF8 . "$d=Join-Path $env:LOCALAPPDATA 'clipsync\incoming\" ts "';(New-Item -ItemType Directory -Force -Path $d).FullName"
     res := SshPs(mkdirPs)
@@ -187,7 +175,7 @@ PushFiles() {
             names.Push(stageAbs "\" name)
         } else {
             fail++
-            OutputDebug("scp push failed for " p ": " scp.stderr "`n")
+            Log("scp push failed for " p ": " scp.stderr)
         }
     }
     if (ok = 0) {
@@ -195,20 +183,89 @@ PushFiles() {
         return
     }
 
-    quoted := ""
+    ; Tell the bridge to set LOCAL's clipboard to the newly-staged paths.
+    list := ""
     for n in names
-        quoted .= (quoted = "" ? "" : ",") . "'" . StrReplace(n, "'", "''") . "'"
-    setPs := PS_UTF8 . "Set-Clipboard -Path " quoted
-    res2 := SshPs(setPs)
-    if (res2.exitCode != 0) {
-        Tip("Set-Clipboard failed: " Trim(res2.stderr), true)
+        list .= (list = "" ? "" : "`n") n
+    tmp := A_Temp "\clipsync_pushfiles_" A_TickCount ".txt"
+    FileAppend(list, tmp, "UTF-8-RAW")
+    res2 := ScpThenPost(tmp, "/files")
+    try FileDelete(tmp)
+    if (res2.exitCode != 0 || !ResponseOk(res2)) {
+        Tip("POST /files failed: " Trim(res2.stderr) " " Trim(res2.stdout), true)
         return
     }
     Tip("Pushed " ok " item(s) to LOCAL" (fail ? " (" fail " failed)" : "") ".")
 }
 
 ; ============================================================================
-;  Helpers
+;  Bridge transport (HTTP via SSH+curl)
+; ============================================================================
+
+; GET <bridge>/<path>
+SshGet(path) {
+    cmd := 'ssh ' SSH_HOST ' curl -s -m ' HTTP_TIMEOUT_S ' ' BRIDGE_URL path
+    return Run2(cmd)
+}
+
+; scp a local file up to LOCAL %TEMP%, POST it to <bridge>/<endpoint> via
+; curl --data-binary, then delete the temp file. The body file lives on LOCAL.
+ScpThenPost(localFile, endpoint) {
+    res := SshPs(PS_UTF8 "$env:TEMP")
+    if (res.exitCode != 0)
+        return res
+    localTemp := Trim(res.stdout, "`r`n `t")
+    if (localTemp = "")
+        return {exitCode: 1, stdout: "", stderr: "could not resolve LOCAL %TEMP%"}
+    target := localTemp "\clipsync_body_" A_TickCount ".bin"
+
+    scp := Run2('scp -q "' localFile '" ' SSH_HOST ':"' target '"')
+    if (scp.exitCode != 0)
+        return scp
+
+    cmd := 'ssh ' SSH_HOST ' curl -s -m ' HTTP_TIMEOUT_S ' -X POST --data-binary "@' target '" -H "Content-Type:text/plain;charset=utf-8" ' BRIDGE_URL endpoint
+    res2 := Run2(cmd)
+
+    ; Best-effort cleanup of the LOCAL temp file
+    SshPs(PS_UTF8 "Remove-Item -LiteralPath '" target "' -Force -ErrorAction SilentlyContinue")
+    return res2
+}
+
+; The bridge always returns "ok" body on success for POSTs. Treat anything
+; else as failure even if curl exit was 0.
+ResponseOk(res) {
+    return Trim(res.stdout, "`r`n `t") = "ok"
+}
+
+; ============================================================================
+;  REMOTE-side clipboard (this machine - works directly, no bridge needed)
+; ============================================================================
+MyClipboardKind() {
+    if (DllCall("IsClipboardFormatAvailable", "uint", 15))   ; CF_HDROP
+        return "files"
+    if (A_Clipboard != "")
+        return "text"
+    return "empty"
+}
+
+MyClipboardFiles() {
+    res := PsLocal(PS_UTF8 "(Get-Clipboard -Format FileDropList).FullName")
+    if (res.exitCode != 0)
+        return []
+    return SplitLines(res.stdout)
+}
+
+SetLocalClipboardFiles(paths) {
+    if (paths.Length = 0)
+        return
+    quoted := ""
+    for p in paths
+        quoted .= (quoted = "" ? "" : ",") . "'" . StrReplace(p, "'", "''") . "'"
+    PsLocal(PS_UTF8 "Set-Clipboard -Path " quoted)
+}
+
+; ============================================================================
+;  Generic helpers
 ; ============================================================================
 
 ; Run any command, capture stdout/stderr/exit code via temp files.
@@ -227,24 +284,20 @@ Run2(cmd) {
     return {exitCode: code, stdout: out, stderr: err}
 }
 
-; Run a PowerShell snippet on LOCAL via SSH using -EncodedCommand
-; (UTF-16-LE base64). This avoids ALL shell-quoting hazards because the
-; encoded blob has no metacharacters that cmd or the remote shell can mangle.
+; PowerShell snippet over SSH via -EncodedCommand (no shell-quoting hazards).
 SshPs(ps) {
     enc := EncodeUtf16Base64(ps)
-    cmd := 'ssh ' SSH_HOST ' powershell -NoProfile -EncodedCommand ' enc
-    return Run2(cmd)
+    return Run2('ssh ' SSH_HOST ' powershell -NoProfile -EncodedCommand ' enc)
 }
 
-; Run a PowerShell snippet locally on REMOTE via -EncodedCommand.
+; PowerShell snippet on this machine via -EncodedCommand.
 PsLocal(ps) {
     enc := EncodeUtf16Base64(ps)
     return Run2('powershell -NoProfile -EncodedCommand ' enc)
 }
 
 ; UTF-16-LE base64 of a string, no CRLFs - the format powershell.exe expects
-; for -EncodedCommand. AHK strings are already UTF-16 internally, so we copy
-; raw bytes directly out of the string buffer.
+; for -EncodedCommand. AHK strings are already UTF-16 internally.
 EncodeUtf16Base64(s) {
     n := StrLen(s)
     if (n = 0)
@@ -252,7 +305,6 @@ EncodeUtf16Base64(s) {
     bytes := n * 2
     bin := Buffer(bytes)
     DllCall("RtlMoveMemory", "ptr", bin, "ptr", StrPtr(s), "ptr", bytes)
-
     flags := 0x40000001  ; CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF
     sizeOut := 0
     DllCall("crypt32\CryptBinaryToStringW"
@@ -267,41 +319,6 @@ EncodeUtf16Base64(s) {
         , "uint", flags
         , "ptr", out, "uint*", &sizeOut)
     return StrGet(out, "UTF-16")
-}
-
-; Inspect REMOTE (this machine) clipboard.
-LocalClipboardKind() {
-    if (DllCall("IsClipboardFormatAvailable", "uint", 15))   ; CF_HDROP
-        return "files"
-    if (A_Clipboard != "")
-        return "text"
-    return "empty"
-}
-
-RemoteClipboardKind() {
-    ps := PS_UTF8 "if ((Get-Clipboard -Format FileDropList | Measure-Object).Count -gt 0) { 'files' } elseif (Get-Clipboard -Raw) { 'text' } else { 'empty' }"
-    res := SshPs(ps)
-    if (res.exitCode != 0)
-        return "ssh-error: " Trim(res.stderr)
-    return Trim(res.stdout, "`r`n `t")
-}
-
-; Read CF_HDROP from REMOTE clipboard via PowerShell.
-GetClipboardFiles() {
-    res := PsLocal(PS_UTF8 "(Get-Clipboard -Format FileDropList).FullName")
-    if (res.exitCode != 0)
-        return []
-    return SplitLines(res.stdout)
-}
-
-; Set REMOTE clipboard to a FileDropList.
-SetClipboardFiles(paths) {
-    if (paths.Length = 0)
-        return
-    quoted := ""
-    for p in paths
-        quoted .= (quoted = "" ? "" : ",") . "'" . StrReplace(p, "'", "''") . "'"
-    PsLocal(PS_UTF8 "Set-Clipboard -Path " quoted)
 }
 
 MakeStagingDir() {
@@ -338,13 +355,6 @@ SplitLines(s) {
     return out
 }
 
-; cmd's "..." quoting: " -> ""  (PowerShell receives a single ").
-; Kept around for reference/legacy; no longer used now that we go through
-; -EncodedCommand.
-EscapeForCmd(s) {
-    return StrReplace(s, '"', '""')
-}
-
 Tip(msg, isError := false) {
     title := isError ? "clipsync (error)" : "clipsync"
     TrayTip(msg, title, isError ? 0x2 : 0x1)
@@ -352,7 +362,6 @@ Tip(msg, isError := false) {
     Log((isError ? "TIP-ERR " : "TIP ") msg)
 }
 
-; --- Debug log --------------------------------------------------------------
 Log(msg) {
     global LOG_PATH
     try {

@@ -1,56 +1,82 @@
 # clipsync
 
-Two-way clipboard + file/folder sync between two Windows 11 machines over outbound SSH. Designed for the case where you access **REMOTE** through PIKVM in a browser on **LOCAL** and can't paste between them.
+Two-way clipboard + file/folder sync between two Windows 11 machines, driven by hotkeys on **REMOTE**. Designed for the case where you access REMOTE through PIKVM in a browser and can't paste between LOCAL and REMOTE.
 
 ## Topology
 
 ```
-LOCAL (sshd)  <----- ssh + scp -----  REMOTE (this script)
-   ^                                       ^
-   |                                       |
-   keyboard ---PIKVM (HID over web)--------+
+LOCAL                                       REMOTE
+-----                                       ------
+clipsync-bridge.ps1                         clipsync.ahk
+  - runs in user logon session                - hotkeys
+  - listens on 127.0.0.1:8765                 - per hotkey:
+  - reads/writes interactive clipboard          ssh local "curl http://127.0.0.1:8765/..."
+                                              - file payloads via scp -r
+        ^                                       |
+        | (loopback, same machine)              | (existing ssh + key auth)
+        '---------------------------------------'
 ```
+
+Why a bridge on LOCAL? On Windows the clipboard is **per-window-station**. SSH-launched processes land in a non-interactive window station, so they can't see the desktop clipboard. The bridge runs in your logon session, so it can — and the SSH session on LOCAL just dials its own loopback to reach it.
 
 - `Ctrl+Alt+Win+V` &mdash; pull LOCAL clipboard onto REMOTE
 - `Ctrl+Alt+Win+C` &mdash; push REMOTE clipboard onto LOCAL
 
-Works with plain text **and** Explorer file/folder selections (CF_HDROP). Files transit via `scp -r` into `%LOCALAPPDATA%\clipsync\incoming\<timestamp>\` on the destination, and the destination clipboard is set to the staged paths so a normal Ctrl+V in Explorer pastes them.
+Handles plain text **and** Explorer file/folder selections (CF_HDROP).
 
 ## Requirements
 
 - **REMOTE**: Windows 11, OpenSSH client (default), key-based SSH already working to LOCAL. **No admin rights needed.**
-- **LOCAL**: Windows 11, OpenSSH server running, your REMOTE pubkey in `authorized_keys`.
+- **LOCAL**: Windows 11, OpenSSH server with your REMOTE pubkey in `authorized_keys`. PowerShell 5.1 (default). **No admin rights needed.**
 
-## Install (on REMOTE)
+## Install
 
-Run from PowerShell **or** cmd.exe (single line works in both):
+### Step 1 - on LOCAL
+
+Copy the `clipsync` folder to LOCAL, then:
+
+```
+powershell -ExecutionPolicy Bypass -File .\install-local.ps1
+```
+
+What it does (user-scope, no elevation):
+
+1. Copies `clipsync-bridge.ps1` to `%LOCALAPPDATA%\clipsync\`
+2. Drops a Startup shortcut so the bridge auto-starts at every login
+3. Launches the bridge now and pings `http://127.0.0.1:8765/ping`
+
+You should see "Bridge responded to /ping. Install complete."
+
+### Step 2 - on REMOTE
+
+Copy the `clipsync` folder to REMOTE, then (single line works in cmd or PowerShell):
 
 ```
 powershell -ExecutionPolicy Bypass -File .\install.ps1 -LocalSshHost 192.168.1.50 -LocalSshUser admin
 ```
 
-> If you split the command over multiple lines, use PowerShell with backtick (\`) continuations. cmd.exe doesn't understand backticks and will treat each line as a separate command.
+> Multi-line continuations: PowerShell uses backtick (\`); cmd doesn't. Use a single line in cmd.
 
-Pass `-LocalSshKey <path>` if you want to pin a specific private key, or `-SkipSshConfig` if you've already got a working `Host clipsync-local` alias in `~/.ssh/config`.
+Pass `-LocalSshKey <path>` to pin a specific private key, or `-SkipSshConfig` if you've already got a `Host clipsync-local` block in `~/.ssh/config`.
 
-What it does (all user-scope, no elevation):
+What it does (user-scope, no elevation):
 
-1. Downloads AutoHotkey v2 portable .zip and extracts to `%LOCALAPPDATA%\AHK\`
+1. Downloads AutoHotkey v2.0.26 portable .zip and extracts to `%LOCALAPPDATA%\AHK\`
 2. Drops `clipsync.ahk` at `%LOCALAPPDATA%\clipsync\clipsync.ahk`
 3. Creates a Startup shortcut so it auto-runs at login
 4. Adds a `Host clipsync-local` block to `~/.ssh/config` (skipped if one exists)
-5. Smoke-tests the SSH alias
+5. Smoke-tests SSH and the bridge `/ping` endpoint
 6. Launches the script
 
 ## Verify
 
 After install, on REMOTE:
 
-```powershell
-ssh clipsync-local 'powershell -NoProfile -c "echo ok"'
+```
+ssh clipsync-local "curl -s http://127.0.0.1:8765/ping"
 ```
 
-Should print `ok` with no prompt. Then:
+Should print `pong`. Then:
 
 | Test | Steps |
 |---|---|
@@ -61,21 +87,35 @@ Should print `ok` with no prompt. Then:
 
 Tray tips on REMOTE confirm success/failure for each transfer.
 
+## Troubleshooting
+
+Logs:
+- REMOTE: `%LOCALAPPDATA%\clipsync\clipsync.log` (every command run, exit code, stderr snippet)
+- LOCAL: `%LOCALAPPDATA%\clipsync\clipsync-bridge.log` (every request)
+
+Common failures:
+
+| Tray tip on REMOTE | Likely cause |
+|---|---|
+| "Bridge unreachable: ..." | bridge not running on LOCAL, or wrong port. Restart from `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\clipsync-bridge.lnk` |
+| "GET /text failed: connect: ..." | SSH itself is fine but bridge isn't listening |
+| "scp ... failed" | a path on LOCAL has unusual characters or the file is locked |
+| Hotkey does nothing at all | clipsync.ahk isn't running on REMOTE; relaunch from Startup folder shortcut |
+
 ## Uninstall
 
-```powershell
+On REMOTE:
+```
 powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
 ```
 
-Flags:
-- `-RemoveAhk`         also delete `%LOCALAPPDATA%\AHK`
-- `-RemoveStaging`     also delete `%LOCALAPPDATA%\clipsync\incoming`
-- `-RemoveSshConfig`   strip the `Host clipsync-local` block from `~/.ssh/config`
+Flags: `-RemoveAhk`, `-RemoveStaging`, `-RemoveSshConfig`.
+
+On LOCAL: stop `powershell.exe` running `clipsync-bridge.ps1`, delete `%LOCALAPPDATA%\clipsync\` and the Startup shortcut.
 
 ## Notes
 
-- Staged transfer folders auto-prune after 7 days (configurable in `clipsync.ahk` &rarr; `PRUNE_DAYS`).
-- Large transfers block the script while `scp` runs; tray tip says "Copying N item(s)..." up front.
+- Staged transfer folders auto-prune after 7 days (`PRUNE_DAYS` in `clipsync.ahk`).
+- AutoHotkey version is pinned to v2.0.26. Override with `-AhkVersion <ver>`.
 - Hotkeys fire on REMOTE only when REMOTE has input focus &mdash; which is whenever the PIKVM tab is focused on LOCAL.
-- AutoHotkey version is pinned to **v2.0.26**. Pass `-AhkVersion <ver>` to `install.ps1` to override.
-- All PowerShell snippets pin `[Console]::OutputEncoding = UTF-8` so Unicode survives the SSH pipe.
+- The bridge binds **127.0.0.1 only** &mdash; not reachable from the LAN. All access goes through your existing SSH connection.

@@ -127,10 +127,17 @@ Host clipsync-local
 }
 
 # ----------------------------------------------------------------------------
-# 5. Smoke test the SSH alias
+# 5. Smoke test the SSH alias and the LOCAL bridge
 # ----------------------------------------------------------------------------
 Info "Testing 'ssh clipsync-local' (5s timeout)..."
-$test = Start-Process -FilePath ssh -ArgumentList @('-o','BatchMode=yes','-o','ConnectTimeout=5','clipsync-local','powershell -NoProfile -Command "echo clipsync-ok"') -NoNewWindow -PassThru -RedirectStandardOutput "$env:TEMP\clipsync_test.out" -RedirectStandardError "$env:TEMP\clipsync_test.err" -Wait
+$test = Start-Process -FilePath ssh `
+    -ArgumentList @(
+        '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5',
+        'clipsync-local', 'echo clipsync-ok'
+    ) `
+    -NoNewWindow -PassThru -Wait `
+    -RedirectStandardOutput "$env:TEMP\clipsync_test.out" `
+    -RedirectStandardError  "$env:TEMP\clipsync_test.err"
 $out = Get-Content "$env:TEMP\clipsync_test.out" -Raw -ErrorAction SilentlyContinue
 $err = Get-Content "$env:TEMP\clipsync_test.err" -Raw -ErrorAction SilentlyContinue
 Remove-Item "$env:TEMP\clipsync_test.out","$env:TEMP\clipsync_test.err" -Force -ErrorAction SilentlyContinue
@@ -140,6 +147,27 @@ if ($test.ExitCode -eq 0 -and $out -match 'clipsync-ok') {
     Warn "SSH test failed (exit $($test.ExitCode))."
     if ($err) { Warn "stderr: $($err.Trim())" }
     Warn "Fix ssh config / key auth before launching clipsync.ahk."
+}
+
+Info "Pinging the LOCAL clipsync-bridge via SSH (10s timeout)..."
+$pingTest = Start-Process -FilePath ssh `
+    -ArgumentList @(
+        '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5',
+        'clipsync-local',
+        'curl -s -m 5 http://127.0.0.1:8765/ping'
+    ) `
+    -NoNewWindow -PassThru -Wait `
+    -RedirectStandardOutput "$env:TEMP\clipsync_ping.out" `
+    -RedirectStandardError  "$env:TEMP\clipsync_ping.err"
+$pingOut = Get-Content "$env:TEMP\clipsync_ping.out" -Raw -ErrorAction SilentlyContinue
+Remove-Item "$env:TEMP\clipsync_ping.out","$env:TEMP\clipsync_ping.err" -Force -ErrorAction SilentlyContinue
+if ($pingTest.ExitCode -eq 0 -and $pingOut -match 'pong') {
+    Info "Bridge ok - LOCAL is ready."
+} else {
+    Warn "Bridge ping failed. The bridge needs to be installed on LOCAL:"
+    Warn "  copy clipsync-bridge.ps1 + install-local.ps1 to LOCAL"
+    Warn "  on LOCAL: powershell -ExecutionPolicy Bypass -File .\install-local.ps1"
+    Warn "Hotkeys won't work until the bridge responds to /ping."
 }
 
 # ----------------------------------------------------------------------------
