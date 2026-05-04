@@ -72,6 +72,8 @@ PullText() {
     }
     A_Clipboard := res.stdout
     Tip("Pulled " StrLen(res.stdout) " chars from LOCAL.")
+    Sleep 100
+    Send "^v"
 }
 
 PullFiles() {
@@ -109,12 +111,16 @@ PullFiles() {
         staged.Push(f)
     SetLocalClipboardFiles(staged)
     Tip("Pulled " ok " item(s) from LOCAL" (fail ? " (" fail " failed)" : "") ".")
+    Sleep 100
+    Send "^v"
 }
 
 ; ============================================================================
 ;  Direction 2: REMOTE -> LOCAL
 ; ============================================================================
 PushToLocal() {
+    Send "^c"
+    Sleep 300
     kind := MyClipboardKind()
     if (kind = "empty") {
         Tip("REMOTE clipboard is empty.", true)
