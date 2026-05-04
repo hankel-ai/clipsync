@@ -203,13 +203,21 @@ PushFiles() {
 ; ============================================================================
 
 ; GET <bridge>/<path>
+;
+; The remote default shell is PowerShell, so:
+;   - 'curl' is an alias for Invoke-WebRequest -> use 'curl.exe' to bypass.
+;   - URL contains no PS metachars so unquoted is fine.
 SshGet(path) {
-    cmd := 'ssh ' SSH_HOST ' curl -s -m ' HTTP_TIMEOUT_S ' ' BRIDGE_URL path
+    cmd := 'ssh ' SSH_HOST ' curl.exe -s -m ' HTTP_TIMEOUT_S ' ' BRIDGE_URL path
     return Run2(cmd)
 }
 
 ; scp a local file up to LOCAL %TEMP%, POST it to <bridge>/<endpoint> via
 ; curl --data-binary, then delete the temp file. The body file lives on LOCAL.
+;
+; Args that contain PS metachars are wrapped in single quotes so PowerShell
+; treats them as literals (otherwise: '@<path>' triggers splatting, ';' is a
+; statement separator, etc.).
 ScpThenPost(localFile, endpoint) {
     res := SshPs(PS_UTF8 "$env:TEMP")
     if (res.exitCode != 0)
@@ -223,7 +231,7 @@ ScpThenPost(localFile, endpoint) {
     if (scp.exitCode != 0)
         return scp
 
-    cmd := 'ssh ' SSH_HOST ' curl -s -m ' HTTP_TIMEOUT_S ' -X POST --data-binary "@' target '" -H "Content-Type:text/plain;charset=utf-8" ' BRIDGE_URL endpoint
+    cmd := 'ssh ' SSH_HOST ' curl.exe -s -m ' HTTP_TIMEOUT_S " -X POST --data-binary '@" target "' -H 'Content-Type:text/plain;charset=utf-8' " BRIDGE_URL endpoint
     res2 := Run2(cmd)
 
     ; Best-effort cleanup of the LOCAL temp file

@@ -49,14 +49,14 @@ function Log($msg) {
     } catch { }
 }
 
-function Read-Line($reader) {
+function Read-Line($stream) {
     $sb = New-Object Text.StringBuilder
     while ($true) {
-        $ch = $reader.Read()
-        if ($ch -lt 0) { return $null }
-        if ($ch -eq 10) { break }                      # LF
-        if ($ch -eq 13) { continue }                    # CR (skip)
-        [void]$sb.Append([char]$ch)
+        $b = $stream.ReadByte()
+        if ($b -lt 0) { return $null }
+        if ($b -eq 10) { break }                       # LF
+        if ($b -eq 13) { continue }                    # CR (skip)
+        [void]$sb.Append([char]$b)
     }
     return $sb.ToString()
 }

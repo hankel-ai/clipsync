@@ -150,11 +150,13 @@ if ($test.ExitCode -eq 0 -and $out -match 'clipsync-ok') {
 }
 
 Info "Pinging the LOCAL clipsync-bridge via SSH (10s timeout)..."
+# Use curl.exe (not curl) - on LOCAL the default shell is PowerShell, where
+# 'curl' is an alias for Invoke-WebRequest with different arg syntax.
 $pingTest = Start-Process -FilePath ssh `
     -ArgumentList @(
         '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5',
         'clipsync-local',
-        'curl -s -m 5 http://127.0.0.1:8765/ping'
+        'curl.exe -s -m 5 http://127.0.0.1:8765/ping'
     ) `
     -NoNewWindow -PassThru -Wait `
     -RedirectStandardOutput "$env:TEMP\clipsync_ping.out" `

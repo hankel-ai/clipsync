@@ -73,7 +73,7 @@ What it does (user-scope, no elevation):
 After install, on REMOTE:
 
 ```
-ssh clipsync-local "curl -s http://127.0.0.1:8765/ping"
+ssh clipsync-local "curl.exe -s http://127.0.0.1:8765/ping"
 ```
 
 Should print `pong`. Then:
