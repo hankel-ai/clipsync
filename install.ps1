@@ -46,13 +46,24 @@ if (Test-Path $ahkExe) {
     Info "AutoHotkey already at $ahkExe - skipping download."
 } else {
     New-Item -ItemType Directory -Force -Path $ahkDir | Out-Null
-    $url = "https://www.autohotkey.com/download/ahk-v2/AutoHotkey_$AhkVersion.zip"
-    $zip = Join-Path $env:TEMP "AutoHotkey_$AhkVersion.zip"
-    Info "Downloading AutoHotkey v$AhkVersion ..."
-    try {
-        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
-    } catch {
-        Fail "Download failed: $_`nTry a different -AhkVersion or download AutoHotkey_<ver>.zip manually and extract it to $ahkDir."
+    $zip  = Join-Path $env:TEMP "AutoHotkey_$AhkVersion.zip"
+    $urls = @(
+        "https://github.com/AutoHotkey/AutoHotkey/releases/download/v$AhkVersion/AutoHotkey_$AhkVersion.zip",
+        "https://www.autohotkey.com/download/2.0/AutoHotkey_$AhkVersion.zip"
+    )
+    $downloaded = $false
+    foreach ($url in $urls) {
+        Info "Downloading AutoHotkey v$AhkVersion from $url ..."
+        try {
+            Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+            $downloaded = $true
+            break
+        } catch {
+            Warn "  failed: $($_.Exception.Message)"
+        }
+    }
+    if (-not $downloaded) {
+        Fail "All download URLs failed. Download AutoHotkey_$AhkVersion.zip manually from https://github.com/AutoHotkey/AutoHotkey/releases and extract it to $ahkDir."
     }
     Info "Extracting to $ahkDir ..."
     Expand-Archive -LiteralPath $zip -DestinationPath $ahkDir -Force

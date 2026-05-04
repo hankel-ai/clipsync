@@ -23,12 +23,13 @@ Works with plain text **and** Explorer file/folder selections (CF_HDROP). Files 
 
 ## Install (on REMOTE)
 
-```powershell
-cd <folder containing these files>
-powershell -ExecutionPolicy Bypass -File .\install.ps1 `
-    -LocalSshHost  192.168.1.50 `
-    -LocalSshUser  admin
+Run from PowerShell **or** cmd.exe (single line works in both):
+
 ```
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -LocalSshHost 192.168.1.50 -LocalSshUser admin
+```
+
+> If you split the command over multiple lines, use PowerShell with backtick (\`) continuations. cmd.exe doesn't understand backticks and will treat each line as a separate command.
 
 Pass `-LocalSshKey <path>` if you want to pin a specific private key, or `-SkipSshConfig` if you've already got a working `Host clipsync-local` alias in `~/.ssh/config`.
 
