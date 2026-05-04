@@ -166,9 +166,13 @@ while ($true) {
                 if (-not $paths -or $paths.Count -eq 0) {
                     Write-Response $stream '400 Bad Request' 'no paths in body'
                 } else {
+                    $data = New-Object Windows.Forms.DataObject
                     $coll = New-Object Collections.Specialized.StringCollection
                     foreach ($p in $paths) { [void]$coll.Add($p) }
-                    [Windows.Forms.Clipboard]::SetFileDropList($coll)
+                    $data.SetFileDropList($coll)
+                    $dropBytes = [byte[]]@(0x05, 0x00, 0x00, 0x00)
+                    $data.SetData('Preferred DropEffect', (New-Object IO.MemoryStream(,$dropBytes)))
+                    [Windows.Forms.Clipboard]::SetDataObject($data, $true)
                     Write-Response $stream '200 OK' 'ok'
                 }
             }
