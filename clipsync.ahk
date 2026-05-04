@@ -32,9 +32,43 @@ TRAY_MS        := 2500
 HTTP_TIMEOUT_S := 15
 PS_UTF8        := "[Console]::OutputEncoding=[Text.Encoding]::UTF8;[Console]::InputEncoding=[Text.Encoding]::UTF8;"
 
+AHK_EXE        := EnvGet("LOCALAPPDATA") "\AHK\AutoHotkey64.exe"
+SCRIPT_PATH    := EnvGet("LOCALAPPDATA") "\clipsync\clipsync.ahk"
+STARTUP_LNK    := A_AppData "\Microsoft\Windows\Start Menu\Programs\Startup\clipsync.lnk"
+
 DirCreate(STAGING_BASE)
 ClearStaging()
 Log("=== clipsync started ===")
+
+; --- Tray menu --------------------------------------------------------------
+tray := A_TrayMenu
+tray.Delete()
+tray.Add("Start with Windows", ToggleStartup)
+if FileExist(STARTUP_LNK)
+    tray.Check("Start with Windows")
+tray.Add()
+tray.Add("Open Log", (*) => Run('notepad.exe "' LOG_PATH '"'))
+tray.Add()
+tray.AddStandard()
+
+ToggleStartup(*) {
+    if FileExist(STARTUP_LNK) {
+        FileDelete(STARTUP_LNK)
+        A_TrayMenu.Uncheck("Start with Windows")
+        Log("startup shortcut removed")
+    } else {
+        ws := ComObject("WScript.Shell")
+        lnk := ws.CreateShortcut(STARTUP_LNK)
+        lnk.TargetPath := AHK_EXE
+        lnk.Arguments := '"' SCRIPT_PATH '"'
+        lnk.WorkingDirectory := EnvGet("LOCALAPPDATA") "\clipsync"
+        lnk.WindowStyle := 7
+        lnk.Description := "clipsync hotkey driver"
+        lnk.Save()
+        A_TrayMenu.Check("Start with Windows")
+        Log("startup shortcut created")
+    }
+}
 
 ; --- Hotkeys ----------------------------------------------------------------
 ^!#v::PullFromLocal()

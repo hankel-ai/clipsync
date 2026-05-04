@@ -273,6 +273,29 @@ $logItem = $menu.Items.Add('Open Log')
 $logItem.Add_Click({ Start-Process notepad.exe $script:logFile })
 [void]$menu.Items.Add('-')
 
+$script:startupLnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'clipsync-bridge.lnk'
+$startupItem = New-Object Windows.Forms.ToolStripMenuItem('Start with Windows')
+$startupItem.CheckOnClick = $true
+$startupItem.Checked = (Test-Path $script:startupLnk)
+$startupItem.Add_CheckedChanged({
+    if ($startupItem.Checked) {
+        $ws = New-Object -ComObject WScript.Shell
+        $lnk = $ws.CreateShortcut($script:startupLnk)
+        $lnk.TargetPath = (Get-Command powershell.exe).Source
+        $lnk.Arguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Sta -File `"$script:bridgePath`""
+        $lnk.WorkingDirectory = $script:logDir
+        $lnk.WindowStyle = 7
+        $lnk.Description = 'clipsync clipboard bridge'
+        $lnk.Save()
+        Log "startup shortcut created"
+    } else {
+        Remove-Item $script:startupLnk -Force -ErrorAction SilentlyContinue
+        Log "startup shortcut removed"
+    }
+})
+[void]$menu.Items.Add($startupItem)
+[void]$menu.Items.Add('-')
+
 $restartItem = $menu.Items.Add('Restart')
 $restartItem.Add_Click({
     Log "restart requested"
