@@ -44,7 +44,7 @@ Log("=== clipsync started ===")
 ;  Direction 1: LOCAL -> REMOTE
 ; ============================================================================
 PullFromLocal() {
-    Tip("Checking LOCAL clipboard...")
+    Tip("Checking LOCAL clipboard...", false, true)
     res := SshGet("/kind")
     if (res.exitCode != 0) {
         Tip("Bridge unreachable: " Trim(res.stderr), true)
@@ -89,7 +89,7 @@ PullFiles() {
 
     stage := MakeStagingDir()
     ok := 0, fail := 0
-    Tip("Copying " paths.Length " item(s) from LOCAL...")
+    Tip("Copying " paths.Length " item(s) from LOCAL...", false, true)
     for path in paths {
         cmd := 'scp -r -q ' SSH_HOST ':"' path '" "' stage '"'
         scp := Run2(cmd)
@@ -119,7 +119,7 @@ PullFiles() {
 ; ============================================================================
 PushToLocal() {
     Send "^c"
-    Tip("Checking REMOTE clipboard...")
+    Tip("Checking REMOTE clipboard...", false, true)
     Sleep 300
     kind := MyClipboardKind()
     if (kind = "empty") {
@@ -171,7 +171,7 @@ PushFiles() {
     }
 
     ok := 0, fail := 0, names := []
-    Tip("Copying " paths.Length " item(s) to LOCAL...")
+    Tip("Copying " paths.Length " item(s) to LOCAL...", false, true)
     for p in paths {
         cmd := 'scp -r -q "' p '" ' SSH_HOST ':"' stageAbs '"'
         scp := Run2(cmd)
@@ -366,9 +366,15 @@ SplitLines(s) {
     return out
 }
 
-Tip(msg, isError := false) {
+ClearTip() {
+    ToolTip()
+}
+
+Tip(msg, isError := false, persist := false) {
     ToolTip((isError ? "[!] " : "") msg)
-    SetTimer(() => ToolTip(), -TRAY_MS)
+    SetTimer(ClearTip, 0)
+    if (!persist)
+        SetTimer(ClearTip, -TRAY_MS)
     Log((isError ? "TIP-ERR " : "TIP ") msg)
 }
 
