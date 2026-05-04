@@ -28,13 +28,12 @@ SSH_HOST       := "clipsync-local"                              ; ssh config ali
 BRIDGE_URL     := "http://127.0.0.1:8765"                       ; bridge on LOCAL loopback
 STAGING_BASE   := EnvGet("LOCALAPPDATA") "\clipsync\incoming"   ; on REMOTE
 LOG_PATH       := EnvGet("LOCALAPPDATA") "\clipsync\clipsync.log"
-PRUNE_DAYS     := 7
 TRAY_MS        := 2500
 HTTP_TIMEOUT_S := 15
 PS_UTF8        := "[Console]::OutputEncoding=[Text.Encoding]::UTF8;[Console]::InputEncoding=[Text.Encoding]::UTF8;"
 
 DirCreate(STAGING_BASE)
-PruneOldStaging()
+ClearStaging()
 Log("=== clipsync started ===")
 
 ; --- Hotkeys ----------------------------------------------------------------
@@ -343,14 +342,11 @@ MakeStagingDir() {
     return dir
 }
 
-PruneOldStaging() {
+ClearStaging() {
     if (!DirExist(STAGING_BASE))
         return
-    cutoff := DateAdd(A_Now, -PRUNE_DAYS, "Days")
     Loop Files, STAGING_BASE "\*", "D" {
-        if (A_LoopFileTimeModified < cutoff) {
-            try DirDelete(A_LoopFileFullPath, true)
-        }
+        try DirDelete(A_LoopFileFullPath, true)
     }
 }
 
