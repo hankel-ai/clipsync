@@ -15,6 +15,7 @@
 ; --- Configuration ----------------------------------------------------------
 SSH_HOST     := "clipsync-local"                              ; ssh config alias
 STAGING_BASE := EnvGet("LOCALAPPDATA") "\clipsync\incoming"   ; on REMOTE
+LOG_PATH     := EnvGet("LOCALAPPDATA") "\clipsync\clipsync.log"
 PRUNE_DAYS   := 7
 TRAY_MS      := 2500
 
@@ -163,7 +164,7 @@ PushFiles() {
 
     ; Make a timestamped staging dir on LOCAL and get its absolute path back
     ts := FormatTime(, "yyyyMMdd-HHmmss")
-    mkdirPs := PS_UTF8 . "$d=Join-Path $env:LOCALAPPDATA 'clipsync\incoming\" ts "';New-Item -ItemType Directory -Force -Path $d|%%{$_.FullName}"
+    mkdirPs := PS_UTF8 . "$d=Join-Path $env:LOCALAPPDATA 'clipsync\incoming\" ts "';(New-Item -ItemType Directory -Force -Path $d).FullName"
     res := SshPs(mkdirPs)
     if (res.exitCode != 0) {
         Tip("Could not create LOCAL staging: " Trim(res.stderr), true)
@@ -220,14 +221,52 @@ Run2(cmd) {
     err    := FileExist(tmpErr) ? FileRead(tmpErr, "UTF-8") : ""
     try FileDelete(tmpOut)
     try FileDelete(tmpErr)
+    Log("RUN ec=" code " out=" StrLen(out) "B err=" StrLen(err) "B :: " SubStr(cmd, 1, 200))
+    if (err != "")
+        Log("  stderr: " SubStr(Trim(err), 1, 400))
     return {exitCode: code, stdout: out, stderr: err}
 }
 
-; Run a PowerShell snippet on LOCAL via SSH. Snippet must NOT contain
-; unescaped double-quotes.
+; Run a PowerShell snippet on LOCAL via SSH using -EncodedCommand
+; (UTF-16-LE base64). This avoids ALL shell-quoting hazards because the
+; encoded blob has no metacharacters that cmd or the remote shell can mangle.
 SshPs(ps) {
-    cmd := 'ssh ' SSH_HOST ' powershell -NoProfile -Command "' EscapeForCmd(ps) '"'
+    enc := EncodeUtf16Base64(ps)
+    cmd := 'ssh ' SSH_HOST ' powershell -NoProfile -EncodedCommand ' enc
     return Run2(cmd)
+}
+
+; Run a PowerShell snippet locally on REMOTE via -EncodedCommand.
+PsLocal(ps) {
+    enc := EncodeUtf16Base64(ps)
+    return Run2('powershell -NoProfile -EncodedCommand ' enc)
+}
+
+; UTF-16-LE base64 of a string, no CRLFs - the format powershell.exe expects
+; for -EncodedCommand. AHK strings are already UTF-16 internally, so we copy
+; raw bytes directly out of the string buffer.
+EncodeUtf16Base64(s) {
+    n := StrLen(s)
+    if (n = 0)
+        return ""
+    bytes := n * 2
+    bin := Buffer(bytes)
+    DllCall("RtlMoveMemory", "ptr", bin, "ptr", StrPtr(s), "ptr", bytes)
+
+    flags := 0x40000001  ; CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF
+    sizeOut := 0
+    DllCall("crypt32\CryptBinaryToStringW"
+        , "ptr", bin, "uint", bytes
+        , "uint", flags
+        , "ptr", 0, "uint*", &sizeOut)
+    if (sizeOut = 0)
+        return ""
+    out := Buffer(sizeOut * 2, 0)
+    DllCall("crypt32\CryptBinaryToStringW"
+        , "ptr", bin, "uint", bytes
+        , "uint", flags
+        , "ptr", out, "uint*", &sizeOut)
+    return StrGet(out, "UTF-16")
 }
 
 ; Inspect REMOTE (this machine) clipboard.
@@ -249,8 +288,7 @@ RemoteClipboardKind() {
 
 ; Read CF_HDROP from REMOTE clipboard via PowerShell.
 GetClipboardFiles() {
-    ps := PS_UTF8 "(Get-Clipboard -Format FileDropList).FullName"
-    res := Run2('powershell -NoProfile -Command "' EscapeForCmd(ps) '"')
+    res := PsLocal(PS_UTF8 "(Get-Clipboard -Format FileDropList).FullName")
     if (res.exitCode != 0)
         return []
     return SplitLines(res.stdout)
@@ -263,8 +301,7 @@ SetClipboardFiles(paths) {
     quoted := ""
     for p in paths
         quoted .= (quoted = "" ? "" : ",") . "'" . StrReplace(p, "'", "''") . "'"
-    ps := PS_UTF8 "Set-Clipboard -Path " quoted
-    Run2('powershell -NoProfile -Command "' EscapeForCmd(ps) '"')
+    PsLocal(PS_UTF8 "Set-Clipboard -Path " quoted)
 }
 
 MakeStagingDir() {
@@ -302,6 +339,8 @@ SplitLines(s) {
 }
 
 ; cmd's "..." quoting: " -> ""  (PowerShell receives a single ").
+; Kept around for reference/legacy; no longer used now that we go through
+; -EncodedCommand.
 EscapeForCmd(s) {
     return StrReplace(s, '"', '""')
 }
@@ -310,4 +349,14 @@ Tip(msg, isError := false) {
     title := isError ? "clipsync (error)" : "clipsync"
     TrayTip(msg, title, isError ? 0x2 : 0x1)
     SetTimer(() => TrayTip(), -TRAY_MS)
+    Log((isError ? "TIP-ERR " : "TIP ") msg)
+}
+
+; --- Debug log --------------------------------------------------------------
+Log(msg) {
+    global LOG_PATH
+    try {
+        line := FormatTime(, "yyyy-MM-dd HH:mm:ss") " " msg "`r`n"
+        FileAppend(line, LOG_PATH, "UTF-8")
+    }
 }
