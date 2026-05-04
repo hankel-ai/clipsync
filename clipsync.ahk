@@ -364,9 +364,8 @@ SplitLines(s) {
 }
 
 Tip(msg, isError := false) {
-    title := isError ? "clipsync (error)" : "clipsync"
-    TrayTip(msg, title, isError ? 0x2 : 0x1)
-    SetTimer(() => TrayTip(), -TRAY_MS)
+    ToolTip((isError ? "[!] " : "") msg)
+    SetTimer(() => ToolTip(), -TRAY_MS)
     Log((isError ? "TIP-ERR " : "TIP ") msg)
 }
 
