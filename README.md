@@ -26,8 +26,105 @@ Handles plain text **and** Explorer file/folder selections (CF_HDROP).
 
 ## Requirements
 
-- **REMOTE**: Windows 11, OpenSSH client (default), key-based SSH already working to LOCAL. **No admin rights needed.**
-- **LOCAL**: Windows 11, OpenSSH server with your REMOTE pubkey in `authorized_keys`. PowerShell 5.1 (default). **No admin rights needed.**
+- **REMOTE**: Windows 11, OpenSSH client (default). **No admin rights needed.**
+- **LOCAL**: Windows 11, OpenSSH **server** running, with key-based auth set up so REMOTE can SSH in without a password. PowerShell 5.1 (default). Admin needed once on LOCAL to install/enable OpenSSH Server; the rest of clipsync needs no admin on either side.
+
+## SSH key setup (one-time)
+
+If REMOTE can already do `ssh <user>@<local-host>` and land at a prompt without typing a password, skip this section.
+
+### Step 0a - on LOCAL: enable OpenSSH Server (admin)
+
+Open PowerShell **as Administrator**:
+
+```powershell
+# Install + start the SSH server
+Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+Start-Service sshd
+Set-Service -Name sshd -StartupType Automatic
+
+# Open the firewall (the install usually creates this rule, but verify)
+Get-NetFirewallRule -Name *ssh* | Format-Table Name,Enabled,Direction,Action
+```
+
+Optional but recommended: set the SSH default shell to PowerShell so the install scripts and `curl.exe` calls in clipsync work as documented:
+
+```powershell
+New-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShell `
+    -Value "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" `
+    -PropertyType String -Force
+```
+
+### Step 0b - on REMOTE: generate a key
+
+```powershell
+ssh-keygen -t ed25519 -f $env:USERPROFILE\.ssh\id_ed25519 -C "clipsync-$env:COMPUTERNAME"
+```
+
+Press Enter twice to skip the passphrase (the key needs to be usable non-interactively from the AHK script). The public key lands at `%USERPROFILE%\.ssh\id_ed25519.pub`.
+
+> Use a Windows path with `-f` (`$env:USERPROFILE\.ssh\id_ed25519`), not `~/.ssh/...` — `~` is unreliable for ssh-keygen on Windows.
+
+Print the public key so you can copy it:
+
+```powershell
+type $env:USERPROFILE\.ssh\id_ed25519.pub
+```
+
+### Step 0c - on LOCAL: authorize the key
+
+This is the **important Windows-specific gotcha**: on Windows OpenSSH server, where you put the public key depends on whether the LOCAL user is an Administrator.
+
+| LOCAL user is in... | `authorized_keys` file |
+|---|---|
+| Administrators group (typical home user) | `C:\ProgramData\ssh\administrators_authorized_keys` |
+| Standard user | `%USERPROFILE%\.ssh\authorized_keys` |
+
+If you put the key in the wrong file the login silently falls back to password and key auth never works.
+
+**For an Administrator user** (PowerShell as Administrator on LOCAL):
+
+```powershell
+# Paste the line from REMOTE here (one line, no trailing whitespace)
+$pubkey = 'ssh-ed25519 AAAA... clipsync-REMOTEHOSTNAME'
+
+$path = 'C:\ProgramData\ssh\administrators_authorized_keys'
+Add-Content -Path $path -Value $pubkey -Encoding ASCII
+
+# OpenSSH refuses to use the file unless ACLs are tight: only Admins + SYSTEM
+icacls $path /inheritance:r
+icacls $path /grant 'Administrators:F' 'SYSTEM:F'
+```
+
+**For a standard (non-admin) user on LOCAL**:
+
+```powershell
+$pubkey = 'ssh-ed25519 AAAA... clipsync-REMOTEHOSTNAME'
+
+$dir = "$env:USERPROFILE\.ssh"
+if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
+Add-Content -Path "$dir\authorized_keys" -Value $pubkey -Encoding ASCII
+```
+
+### Step 0d - on REMOTE: verify and add a Host alias
+
+```powershell
+ssh <local-user>@<local-ip-or-hostname> "hostname"
+```
+
+Should print LOCAL's hostname with no password prompt. If it asks for a password, the key isn't being used &mdash; double-check the file from Step 0c.
+
+The clipsync REMOTE installer (`install.ps1`) will add a `Host clipsync-local` block to `~/.ssh/config` for you when you pass `-LocalSshHost` and `-LocalSshUser`. If you want to do it manually, append to `%USERPROFILE%\.ssh\config`:
+
+```
+Host clipsync-local
+    HostName 192.168.1.50
+    User admin
+    IdentityFile ~/.ssh/id_ed25519
+    IdentitiesOnly yes
+```
+
+Then `ssh clipsync-local "hostname"` should also succeed.
 
 ## Install
 
