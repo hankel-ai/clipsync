@@ -49,11 +49,13 @@ On Windows the clipboard is **per-window-station**. SSH-launched processes land 
 ## Bridge endpoints
 
 - `GET /ping`  &rarr; `pong`
-- `GET /kind`  &rarr; `text` | `files` | `empty`
+- `GET /kind`  &rarr; `text` | `files` | `image` | `empty`
 - `GET /text`  &rarr; clipboard text (UTF-8 body)
 - `POST /text` &rarr; sets clipboard from request body (UTF-8); empty body clears
 - `GET /files` &rarr; CF_HDROP paths, one per line
 - `POST /files` &rarr; sets clipboard FileDropList from newline-separated body
+- `GET /image` &rarr; saves clipboard image as PNG under `%LOCALAPPDATA%\clipsync\outgoing\img_<ticks>.png`, returns the absolute LOCAL path (AHK scp's it down)
+- `POST /image` &rarr; body is a LOCAL absolute path to a PNG the caller has scp'd up; bridge loads it via `[Drawing.Image]::FromFile`, calls `SetImage`, deletes the file
 
 ## Key design decisions
 
@@ -78,7 +80,6 @@ Quick sanity from REMOTE: `ssh clipsync-local "curl -s http://127.0.0.1:8765/pin
 
 ## Open work
 
-- Image clipboard format (CF_BITMAP) not handled. Would need PNG round-trip via temp file + `[Windows.Forms.Clipboard]::SetImage`.
 - Push/pull of huge files blocks the AHK script while scp runs. Tray tip warns up front; not a real issue at typical sizes.
 - No throttling; spamming the hotkey will queue overlapping ssh+scp processes.
 - Bridge has no idle timeout; runs until logoff. Could add `$IdleMinutes` param, but the marginal win is small.

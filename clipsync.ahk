@@ -93,6 +93,8 @@ PullFromLocal() {
         PullText()
     else if (kind = "files")
         PullFiles()
+    else if (kind = "image")
+        PullImage()
     else
         Tip("Bridge returned unknown kind: " kind, true)
 }
@@ -148,6 +150,45 @@ PullFiles() {
     Send "^v"
 }
 
+PullImage() {
+    res := SshGet("/image")
+    if (res.exitCode != 0) {
+        Tip("GET /image failed: " Trim(res.stderr), true)
+        return
+    }
+    localPath := Trim(res.stdout, "`r`n `t")
+    if (localPath = "") {
+        Tip("Bridge returned empty path for image.", true)
+        return
+    }
+
+    stage := MakeStagingDir()
+    Tip("Pulling image from LOCAL...", false, true)
+    scp := Run2('scp -q ' SSH_HOST ':"' localPath '" "' stage '"')
+    if (scp.exitCode != 0) {
+        Tip("scp pull image failed: " Trim(scp.stderr), true)
+        return
+    }
+
+    SplitPath(localPath, &name)
+    staged := stage "\" name
+    if (!FileExist(staged)) {
+        Tip("Staged PNG missing at " staged, true)
+        return
+    }
+
+    pathEsc := StrReplace(staged, "'", "''")
+    ps := PS_UTF8 "Add-Type -AssemblyName System.Windows.Forms;Add-Type -AssemblyName System.Drawing;$img=[Drawing.Image]::FromFile('" pathEsc "');try { [Windows.Forms.Clipboard]::SetImage($img) } finally { $img.Dispose() }"
+    setRes := PsLocal(ps)
+    if (setRes.exitCode != 0) {
+        Tip("SetImage failed: " Trim(setRes.stderr), true)
+        return
+    }
+    Tip("Pulled image from LOCAL.")
+    Sleep 100
+    Send "^v"
+}
+
 ; ============================================================================
 ;  Direction 2: REMOTE -> LOCAL
 ; ============================================================================
@@ -164,6 +205,8 @@ PushToLocal() {
         PushText()
     else if (kind = "files")
         PushFiles()
+    else if (kind = "image")
+        PushImage()
     else
         Tip("Unknown REMOTE clipboard format.", true)
 }
@@ -238,6 +281,53 @@ PushFiles() {
     Tip("Pushed " ok " item(s) to LOCAL" (fail ? " (" fail " failed)" : "") ".")
 }
 
+PushImage() {
+    remoteTmp := A_Temp "\clipsync_img_" A_TickCount ".png"
+    tmpEsc := StrReplace(remoteTmp, "'", "''")
+    ps := PS_UTF8 "Add-Type -AssemblyName System.Windows.Forms;Add-Type -AssemblyName System.Drawing;$i=[Windows.Forms.Clipboard]::GetImage();if ($null -eq $i) { exit 2 };$i.Save('" tmpEsc "', [Drawing.Imaging.ImageFormat]::Png);$i.Dispose()"
+    saveRes := PsLocal(ps)
+    if (saveRes.exitCode != 0) {
+        Tip("Could not save REMOTE clipboard image: " Trim(saveRes.stderr), true)
+        return
+    }
+    if (!FileExist(remoteTmp)) {
+        Tip("REMOTE PNG missing at " remoteTmp, true)
+        return
+    }
+
+    res := SshPs(PS_UTF8 "$env:TEMP")
+    if (res.exitCode != 0) {
+        try FileDelete(remoteTmp)
+        Tip("Could not resolve LOCAL TEMP: " Trim(res.stderr), true)
+        return
+    }
+    localTemp := Trim(res.stdout, "`r`n `t")
+    if (localTemp = "") {
+        try FileDelete(remoteTmp)
+        Tip("LOCAL TEMP was empty.", true)
+        return
+    }
+    localPng := localTemp "\clipsync_img_" A_TickCount ".png"
+
+    Tip("Pushing image to LOCAL...", false, true)
+    scp := Run2('scp -q "' remoteTmp '" ' SSH_HOST ':"' localPng '"')
+    try FileDelete(remoteTmp)
+    if (scp.exitCode != 0) {
+        Tip("scp push image failed: " Trim(scp.stderr), true)
+        return
+    }
+
+    bodyFile := A_Temp "\clipsync_imgpath_" A_TickCount ".txt"
+    FileAppend(localPng, bodyFile, "UTF-8-RAW")
+    res2 := ScpThenPost(bodyFile, "/image")
+    try FileDelete(bodyFile)
+    if (res2.exitCode != 0 || !ResponseOk(res2)) {
+        Tip("POST /image failed: " Trim(res2.stderr) " " Trim(res2.stdout), true)
+        return
+    }
+    Tip("Pushed image to LOCAL.")
+}
+
 ; ============================================================================
 ;  Bridge transport (HTTP via SSH+curl)
 ; ============================================================================
@@ -291,6 +381,8 @@ ResponseOk(res) {
 MyClipboardKind() {
     if (DllCall("IsClipboardFormatAvailable", "uint", 15))   ; CF_HDROP
         return "files"
+    if (DllCall("IsClipboardFormatAvailable", "uint", 8))    ; CF_DIB
+        return "image"
     if (A_Clipboard != "")
         return "text"
     return "empty"

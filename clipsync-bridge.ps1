@@ -170,6 +170,7 @@ function Handle-Connection {
             }
             'GET /kind' {
                 $kind = if ([Windows.Forms.Clipboard]::ContainsFileDropList()) { 'files' }
+                        elseif ([Windows.Forms.Clipboard]::ContainsImage())    { 'image' }
                         elseif ([Windows.Forms.Clipboard]::ContainsText())     { 'text'  }
                         else { 'empty' }
                 Write-Response $stream '200 OK' $kind
@@ -212,6 +213,31 @@ function Handle-Connection {
                     }
                 }
             }
+            'GET /image' {
+                $img = [Windows.Forms.Clipboard]::GetImage()
+                if ($null -eq $img) {
+                    Write-Response $stream '404 Not Found' 'no image on clipboard'
+                } else {
+                    $outDir = Join-Path $env:LOCALAPPDATA 'clipsync\outgoing'
+                    if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Force -Path $outDir | Out-Null }
+                    $pngPath = Join-Path $outDir ("img_{0}.png" -f [Environment]::TickCount)
+                    $img.Save($pngPath, [Drawing.Imaging.ImageFormat]::Png)
+                    $img.Dispose()
+                    Write-Response $stream '200 OK' $pngPath
+                }
+            }
+            'POST /image' {
+                $path = $bodyText.Trim()
+                if (-not $path -or -not (Test-Path -LiteralPath $path)) {
+                    Write-Response $stream '400 Bad Request' "no png at '$path'"
+                } else {
+                    $img = [Drawing.Image]::FromFile($path)
+                    try { [Windows.Forms.Clipboard]::SetImage($img) }
+                    finally { $img.Dispose() }
+                    Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+                    Write-Response $stream '200 OK' 'ok'
+                }
+            }
             default {
                 Write-Response $stream '404 Not Found' "no route for $key"
             }
@@ -232,6 +258,14 @@ $stagingDir = Join-Path $env:LOCALAPPDATA 'clipsync\incoming'
 if (Test-Path $stagingDir) {
     try { Remove-Item "$stagingDir\*" -Recurse -Force; Log "cleared staging" }
     catch { Log "staging clear failed: $($_.Exception.Message)" }
+}
+
+$outgoingDir = Join-Path $env:LOCALAPPDATA 'clipsync\outgoing'
+if (Test-Path $outgoingDir) {
+    try { Remove-Item "$outgoingDir\*" -Recurse -Force; Log "cleared outgoing" }
+    catch { Log "outgoing clear failed: $($_.Exception.Message)" }
+} else {
+    New-Item -ItemType Directory -Force -Path $outgoingDir | Out-Null
 }
 
 # ---------------------------------------------------------------------------
