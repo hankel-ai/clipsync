@@ -27,6 +27,11 @@
 SSH_HOST       := "clipsync-local"                              ; ssh config alias
 BRIDGE_URL     := "http://127.0.0.1:8765"                       ; bridge on LOCAL loopback
 STAGING_BASE   := EnvGet("LOCALAPPDATA") "\clipsync\incoming"   ; on REMOTE
+; Shared staging dir ON LOCAL. REMOTE-pushed files/images land here so the
+; bridge (running as the desktop user) can read them even though scp runs as a
+; separate low-privilege SSH account. Must match -ShareDir in the bridge /
+; setup-ssh-account.ps1. Change here if you relocate the share.
+LOCAL_SHARE    := "C:\clipsync-share"
 LOG_PATH       := EnvGet("LOCALAPPDATA") "\clipsync\clipsync.log"
 TRAY_MS        := 2500
 HTTP_TIMEOUT_S := 15
@@ -232,10 +237,11 @@ PushFiles() {
         return
     }
 
-    ; Make a timestamped staging dir on LOCAL via plain SSH (filesystem ops
-    ; don't need the interactive session).
+    ; Make a timestamped staging dir under the LOCAL shared dir via plain SSH.
+    ; Must be the SHARE (not the SSH account's profile) so the bridge, running
+    ; as the desktop user, can read the files back to set the clipboard.
     ts := FormatTime(, "yyyyMMdd-HHmmss")
-    mkdirPs := PS_UTF8 . "$d=Join-Path $env:LOCALAPPDATA 'clipsync\incoming\" ts "';(New-Item -ItemType Directory -Force -Path $d).FullName"
+    mkdirPs := PS_UTF8 . "$d='" LOCAL_SHARE "\incoming\" ts "';(New-Item -ItemType Directory -Force -Path $d).FullName"
     res := SshPs(mkdirPs)
     if (res.exitCode != 0) {
         Tip("Could not create LOCAL staging: " Trim(res.stderr), true)
@@ -295,19 +301,21 @@ PushImage() {
         return
     }
 
-    res := SshPs(PS_UTF8 "$env:TEMP")
+    ; Stage the PNG in the LOCAL shared dir (not the SSH account's %TEMP%) so the
+    ; bridge, running as the desktop user, can read it for POST /image.
+    res := SshPs(PS_UTF8 "$d='" LOCAL_SHARE "\incoming';(New-Item -ItemType Directory -Force -Path $d).FullName")
     if (res.exitCode != 0) {
         try FileDelete(remoteTmp)
-        Tip("Could not resolve LOCAL TEMP: " Trim(res.stderr), true)
+        Tip("Could not ensure LOCAL share: " Trim(res.stderr), true)
         return
     }
-    localTemp := Trim(res.stdout, "`r`n `t")
-    if (localTemp = "") {
+    localShare := Trim(res.stdout, "`r`n `t")
+    if (localShare = "") {
         try FileDelete(remoteTmp)
-        Tip("LOCAL TEMP was empty.", true)
+        Tip("LOCAL share path was empty.", true)
         return
     }
-    localPng := localTemp "\clipsync_img_" A_TickCount ".png"
+    localPng := localShare "\clipsync_img_" A_TickCount ".png"
 
     Tip("Pushing image to LOCAL...", false, true)
     scp := Run2('scp -q "' remoteTmp '" ' SSH_HOST ':"' localPng '"')

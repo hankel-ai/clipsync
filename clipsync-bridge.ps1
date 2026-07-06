@@ -8,13 +8,24 @@
 
     Endpoints:
       GET  /ping     -> "pong"
-      GET  /kind     -> "text" | "files" | "empty"
+      GET  /kind     -> "text" | "files" | "image" | "empty"
       GET  /text     -> clipboard text (UTF-8 body)
       POST /text     -> set clipboard from request body (UTF-8)
-      GET  /files    -> file paths, one per line
+      GET  /files    -> file paths (in the shared staging dir), one per line
       POST /files    -> set clipboard FileDropList from newline-separated paths
+      GET  /image    -> saves clipboard image as PNG under the shared dir, returns path
+      POST /image    -> loads a PNG (in the shared dir) onto the clipboard, deletes it
 
     No auth: bound to 127.0.0.1 only, reachable only via this user's loopback.
+
+    Shared staging dir (-ShareDir, default C:\clipsync-share):
+      File and image payloads transit this directory rather than the bridge
+      user's profile. This lets clipsync run over a *separate* low-privilege SSH
+      account: scp runs as that account and reads/writes the share, while the
+      bridge (running as the interactive desktop user) also reads/writes the
+      share. GET /files copies the desktop clipboard's files into the share so
+      the SSH account can scp them; the desktop user's private profile stays
+      unreadable to the SSH account. See setup-ssh-account.ps1.
 
     PowerShell 5.1 is STA by default; we assert STA on startup and bail
     otherwise (clipboard APIs require single-threaded apartment).
@@ -23,7 +34,8 @@
 [CmdletBinding()]
 param(
     [string]$Bind = '127.0.0.1',
-    [int]$Port = 8765
+    [int]$Port = 8765,
+    [string]$ShareDir = 'C:\clipsync-share'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -40,6 +52,14 @@ $script:logDir  = Join-Path $env:LOCALAPPDATA 'clipsync'
 if (-not (Test-Path $script:logDir)) { New-Item -ItemType Directory -Force -Path $script:logDir | Out-Null }
 $script:logFile = Join-Path $script:logDir 'clipsync-bridge.log'
 $script:bridgePath = $MyInvocation.MyCommand.Path
+
+# Shared staging dir (readable/writable by both the bridge's desktop user and
+# the low-privilege SSH account). File/image payloads transit here.
+#   <share>\outgoing\ : files/images the bridge copies out for REMOTE to scp down
+#   <share>\incoming\ : files/images REMOTE scp's up for the bridge to consume
+$script:shareDir     = $ShareDir
+$script:shareOutgoing = Join-Path $script:shareDir 'outgoing'
+$script:shareIncoming = Join-Path $script:shareDir 'incoming'
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -189,10 +209,34 @@ function Handle-Connection {
                 Write-Response $stream '200 OK' 'ok'
             }
             'GET /files' {
+                # Copy the desktop clipboard's files into the shared staging dir
+                # and return THOSE paths. The SSH account can't read the desktop
+                # user's private profile, but it can read the share.
                 $files = [Windows.Forms.Clipboard]::GetFileDropList()
-                $arr = @()
-                if ($files) { foreach ($f in $files) { $arr += [string]$f } }
-                Write-Response $stream '200 OK' ($arr -join "`n")
+                if (-not $files -or $files.Count -eq 0) {
+                    Write-Response $stream '200 OK' ''
+                } else {
+                    $ts = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
+                    $stage = Join-Path $script:shareOutgoing $ts
+                    New-Item -ItemType Directory -Force -Path $stage | Out-Null
+                    $arr = @()
+                    foreach ($f in $files) {
+                        $src = [string]$f
+                        try {
+                            $leaf = Split-Path -Leaf $src
+                            $dst  = Join-Path $stage $leaf
+                            if (Test-Path -LiteralPath $src -PathType Container) {
+                                Copy-Item -LiteralPath $src -Destination $dst -Recurse -Force
+                            } else {
+                                Copy-Item -LiteralPath $src -Destination $dst -Force
+                            }
+                            $arr += $dst
+                        } catch {
+                            Log "GET /files copy failed for '$src': $($_.Exception.Message)"
+                        }
+                    }
+                    Write-Response $stream '200 OK' ($arr -join "`n")
+                }
             }
             'POST /files' {
                 $paths = ($bodyText -split "`r?`n") | Where-Object { $_ -ne '' }
@@ -218,7 +262,8 @@ function Handle-Connection {
                 if ($null -eq $img) {
                     Write-Response $stream '404 Not Found' 'no image on clipboard'
                 } else {
-                    $outDir = Join-Path $env:LOCALAPPDATA 'clipsync\outgoing'
+                    # Save under the shared dir so the SSH account can scp it down.
+                    $outDir = $script:shareOutgoing
                     if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Force -Path $outDir | Out-Null }
                     $pngPath = Join-Path $outDir ("img_{0}.png" -f [Environment]::TickCount)
                     $img.Save($pngPath, [Drawing.Imaging.ImageFormat]::Png)
@@ -252,20 +297,26 @@ function Handle-Connection {
 }
 
 # ---------------------------------------------------------------------------
-# Startup: clear staging
+# Startup: ensure shared staging dirs exist, prune old transfers (>7 days).
+# We prune rather than wipe: the SSH account may be mid-transfer into
+# <share>\incoming when the bridge (re)starts, and pruning by age is safe.
 # ---------------------------------------------------------------------------
-$stagingDir = Join-Path $env:LOCALAPPDATA 'clipsync\incoming'
-if (Test-Path $stagingDir) {
-    try { Remove-Item "$stagingDir\*" -Recurse -Force; Log "cleared staging" }
-    catch { Log "staging clear failed: $($_.Exception.Message)" }
+foreach ($d in @($script:shareOutgoing, $script:shareIncoming)) {
+    if (-not (Test-Path $d)) {
+        try { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+        catch { Log "could not create share dir ${d}: $($_.Exception.Message)" }
+    }
 }
-
-$outgoingDir = Join-Path $env:LOCALAPPDATA 'clipsync\outgoing'
-if (Test-Path $outgoingDir) {
-    try { Remove-Item "$outgoingDir\*" -Recurse -Force; Log "cleared outgoing" }
-    catch { Log "outgoing clear failed: $($_.Exception.Message)" }
-} else {
-    New-Item -ItemType Directory -Force -Path $outgoingDir | Out-Null
+$cutoff = (Get-Date).AddDays(-7)
+foreach ($d in @($script:shareOutgoing, $script:shareIncoming)) {
+    if (Test-Path $d) {
+        try {
+            Get-ChildItem -LiteralPath $d -Force -ErrorAction SilentlyContinue |
+                Where-Object { $_.LastWriteTime -lt $cutoff } |
+                ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+            Log "pruned share dir $d (>7d)"
+        } catch { Log "share prune failed for ${d}: $($_.Exception.Message)" }
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -316,7 +367,7 @@ $startupItem.Add_CheckedChanged({
         $ws = New-Object -ComObject WScript.Shell
         $lnk = $ws.CreateShortcut($script:startupLnk)
         $lnk.TargetPath = (Get-Command powershell.exe).Source
-        $lnk.Arguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Sta -File `"$script:bridgePath`""
+        $lnk.Arguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Sta -File `"$script:bridgePath`" -Bind $Bind -Port $Port -ShareDir `"$script:shareDir`""
         $lnk.WorkingDirectory = $script:logDir
         $lnk.WindowStyle = 7
         $lnk.Description = 'clipsync clipboard bridge'
@@ -340,7 +391,8 @@ $restartItem.Add_Click({
         '-NoProfile', '-WindowStyle', 'Hidden',
         '-ExecutionPolicy', 'Bypass', '-Sta',
         '-File', $script:bridgePath,
-        '-Bind', $Bind, '-Port', $Port
+        '-Bind', $Bind, '-Port', $Port,
+        '-ShareDir', $script:shareDir
     ) -WindowStyle Hidden
     $script:notifyIcon.Visible = $false
     $script:notifyIcon.Dispose()

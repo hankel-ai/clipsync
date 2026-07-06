@@ -2,7 +2,10 @@
 
 ## Purpose
 
-Two-way clipboard + file/folder sync between two Windows 11 machines (LOCAL and REMOTE) when access to REMOTE is via PIKVM (browser-based KVM with HID forwarding but no clipboard bridge). Hotkeys live on REMOTE only.
+Two-way clipboard + file/folder sync between a LOCAL machine and one or more REMOTE machines, when access to REMOTE is via a browser-based remote-desktop transport that can't move files (PIKVM for a Windows REMOTE, Chrome Remote Desktop for a macOS REMOTE). Hotkeys live on REMOTE only.
+
+- **LOCAL** is Windows 11 (`admin` desktop session runs the bridge). REMOTE SSHes into LOCAL as a **dedicated low-privilege `clipsync` account** — NOT `admin` — so a key compromise can't hand over an administrator session. File/image payloads transit a **shared staging dir** (`C:\clipsync-share`) both accounts can read/write.
+- **REMOTE** can be **Windows** (hotkeys via AutoHotkey, `clipsync.ahk`) or **macOS** (hotkeys via Hammerspoon, `clipsync.lua`). Both talk to the same bridge over the same endpoints.
 
 ## Architecture
 
@@ -20,8 +23,17 @@ LOCAL (interactive logon session)        REMOTE (interactive desktop)
 ```
 
 Two transports:
-- **Clipboard read/write**: REMOTE runs `ssh local "curl http://127.0.0.1:8765/<endpoint>"`. The SSH session on LOCAL hits its own loopback, where the bridge (which is in the user's interactive session) handles the actual clipboard call.
-- **File payloads**: plain `scp -r` from REMOTE in either direction. Files don't need the bridge.
+- **Clipboard read/write**: REMOTE runs `ssh local "curl http://127.0.0.1:8765/<endpoint>"`. The SSH session on LOCAL hits its own loopback, where the bridge (which is in the `admin` interactive session) handles the actual clipboard call. Works even though the SSH account is a *different* (non-admin) user — any local account can dial loopback.
+- **File payloads**: `scp -r` from REMOTE in either direction, staged through `C:\clipsync-share`. scp runs as the `clipsync` SSH account, which can't read `admin`'s profile, so all payloads go through the shared dir instead.
+
+## The non-admin SSH account (`clipsync`) + shared staging dir
+
+REMOTE authenticates to LOCAL as a dedicated **`clipsync`** account (SSH-only: interactive/RDP logon denied), provisioned once by `setup-ssh-account.ps1` (elevated). The bridge still runs as `admin` in the desktop session. The tension is files: `scp` runs as `clipsync`, but the clipboard lives under `admin`. Resolution — a shared dir `C:\clipsync-share` (ACL: Modify for both `admin` and `clipsync`):
+
+- **Pull** (LOCAL→REMOTE): `GET /files` makes the bridge *copy* `admin`'s selected files into `C:\clipsync-share\outgoing\<ts>` and return those paths; REMOTE scp's them from there. `GET /image` saves the PNG under the share too.
+- **Push** (REMOTE→LOCAL): REMOTE scp's into `C:\clipsync-share\incoming\<ts>`, then `POST /files`/`POST /image` hands the bridge the share paths to set on `admin`'s clipboard.
+
+`admin`'s private profile stays unreadable to `clipsync`. Once all REMOTEs use `clipsync`, remove `admin`'s key from `C:\ProgramData\ssh\administrators_authorized_keys` so `admin` is no longer SSH-reachable.
 
 ## The "why a bridge" gotcha
 
@@ -29,22 +41,26 @@ On Windows the clipboard is **per-window-station**. SSH-launched processes land 
 
 ## Tech stack
 
-- **AutoHotkey v2 (portable)** &mdash; hotkey host on REMOTE.
-- **PowerShell 5.1** &mdash; both ends. Bridge needs STA threading (default for powershell.exe; explicitly passed via `-Sta` in the Startup shortcut).
-- **OpenSSH client** &mdash; built-in on Windows 11. Used for both `ssh "curl ..."` (clipboard channel) and `scp -r` (file payloads).
-- **`curl.exe`** &mdash; built-in on Windows 10/11. Used inside the SSH session on LOCAL to dial the bridge.
+- **AutoHotkey v2 (portable)** &mdash; hotkey host on a **Windows** REMOTE.
+- **Hammerspoon (Lua)** &mdash; hotkey host on a **macOS** REMOTE (`clipsync.lua`). Needs Accessibility permission (granted once). User-scope, no admin.
+- **PowerShell 5.1** &mdash; LOCAL bridge + Windows REMOTE + setup. Bridge needs STA threading (default for powershell.exe; explicitly passed via `-Sta` in the Startup shortcut).
+- **OpenSSH client** &mdash; built-in on Windows 11 and macOS. Used for both `ssh "curl ..."` (clipboard channel) and `scp -r` (file payloads).
+- **`curl.exe`** &mdash; built-in on Windows 10/11. Used inside the SSH session **on LOCAL** to dial the bridge (both REMOTE kinds call it via `ssh clipsync-local curl.exe ...`).
 - **TcpListener (System.Net.Sockets)** &mdash; bridge transport. Avoids `HttpListener` which needs URL-ACL reservation (admin) for non-default prefixes.
 
 ## Files
 
 | Path | Role | Runs on |
 |---|---|---|
-| `clipsync.ahk` | Hotkey driver. Two hotkeys, dispatch by clipboard kind, GET/POST against the bridge for clipboard, scp for file bytes. | REMOTE |
-| `install.ps1` | REMOTE installer: AHK portable download, script placement, Startup shortcut, ssh config alias, smoke test. | REMOTE |
-| `uninstall.ps1` | REMOTE uninstaller. | REMOTE |
-| `clipsync-bridge.ps1` | TCP listener on 127.0.0.1:8765, handles GET/POST for /kind /text /files /ping. STA-required. | LOCAL |
-| `install-local.ps1` | LOCAL installer: copies bridge, creates Startup shortcut, launches it, /ping check. | LOCAL |
-| `README.md` | User-facing usage. | both |
+| `clipsync.ahk` | Windows REMOTE hotkey driver. Two hotkeys (Ctrl+Alt+Win+V/C), dispatch by clipboard kind, GET/POST against the bridge for clipboard, scp (via `C:\clipsync-share`) for file bytes. | Windows REMOTE |
+| `clipsync.lua` | macOS REMOTE hotkey driver (Hammerspoon). Ctrl+Alt+Cmd+V/C, same bridge/endpoints, Finder selection via AppleScript, pasteboard file URLs, auto Cmd+C/V. | macOS REMOTE |
+| `install.ps1` | Windows REMOTE installer: AHK portable download, script placement, Startup shortcut, ssh config alias (`User clipsync`), smoke test. | Windows REMOTE |
+| `install-mac.sh` | macOS REMOTE installer: Hammerspoon, `~/.hammerspoon/clipsync.lua` + `require`, ssh key + `clipsync-local` alias, Accessibility prompt, /ping. | macOS REMOTE |
+| `uninstall.ps1` | Windows REMOTE uninstaller. | Windows REMOTE |
+| `setup-ssh-account.ps1` | **Elevated, one-time on LOCAL.** Creates the `clipsync` SSH-only account, `C:\clipsync-share` + ACLs, authorized_keys, ensures sshd. `-AddKeyOnly ssh-ed25519 AAAA... comment` (key as trailing tokens, or paste when prompted) to authorize a REMOTE's key. | LOCAL (admin) |
+| `clipsync-bridge.ps1` | TCP listener on 127.0.0.1:8765, GET/POST for /ping /kind /text /files /image. Routes files/images through `C:\clipsync-share` (`-ShareDir`). STA-required. Runs as `admin`. | LOCAL |
+| `install-local.ps1` | LOCAL installer: copies bridge, Startup shortcut (passes `-ShareDir`), launches it, /ping check. Non-elevated. | LOCAL |
+| `README.md` | User-facing usage. | all |
 
 ## Bridge endpoints
 
@@ -52,10 +68,10 @@ On Windows the clipboard is **per-window-station**. SSH-launched processes land 
 - `GET /kind`  &rarr; `text` | `files` | `image` | `empty`
 - `GET /text`  &rarr; clipboard text (UTF-8 body)
 - `POST /text` &rarr; sets clipboard from request body (UTF-8); empty body clears
-- `GET /files` &rarr; CF_HDROP paths, one per line
-- `POST /files` &rarr; sets clipboard FileDropList from newline-separated body
-- `GET /image` &rarr; saves clipboard image as PNG under `%LOCALAPPDATA%\clipsync\outgoing\img_<ticks>.png`, returns the absolute LOCAL path (AHK scp's it down)
-- `POST /image` &rarr; body is a LOCAL absolute path to a PNG the caller has scp'd up; bridge loads it via `[Drawing.Image]::FromFile`, calls `SetImage`, deletes the file
+- `GET /files` &rarr; **copies** the clipboard's files into `C:\clipsync-share\outgoing\<ts>\` and returns those share paths, one per line (so the non-admin scp account can read them)
+- `POST /files` &rarr; sets clipboard FileDropList from newline-separated body (paths the caller has scp'd into `C:\clipsync-share\incoming\`)
+- `GET /image` &rarr; saves clipboard image as PNG under `C:\clipsync-share\outgoing\img_<ticks>.png`, returns the absolute LOCAL path (REMOTE scp's it down)
+- `POST /image` &rarr; body is a LOCAL absolute path to a PNG under the share the caller has scp'd up; bridge loads it via `[Drawing.Image]::FromFile`, calls `SetImage`, deletes the file
 
 ## Key design decisions
 
@@ -63,7 +79,10 @@ On Windows the clipboard is **per-window-station**. SSH-launched processes land 
 - **Why bind 127.0.0.1 only**: bridge is reachable only via SSH-session loopback. Zero LAN exposure, no auth needed.
 - **Why -EncodedCommand for SSH PowerShell calls** (`SshPs` in clipsync.ahk): cmd + ssh + remote-cmd quoting layers were corrupting characters like `|`, `(`, `;`. UTF-16 base64 is opaque to all of them.
 - **Why scp for file payloads, bridge only for clipboard**: scp uses sftp-server which works regardless of session, has built-in recursion, and would be silly to reinvent in PS.
-- **Per-transfer staging dirs**: `%LOCALAPPDATA%\clipsync\incoming\<timestamp>\` on both sides. Avoids name collisions and makes cleanup obvious. Pruned >7 days old on script start.
+- **Why a separate `clipsync` SSH account (not `admin`)**: don't expose an administrator session over SSH. The clipboard channel is unaffected (loopback); files need the shared dir because scp runs as the non-admin account.
+- **Why a shared dir instead of granting `clipsync` into `admin`'s profile**: keeps `admin`'s private files unreadable to the SSH account — the isolation is the whole point.
+- **macOS pasteboard file paste**: `clipsync.lua` writes `{url="file://..."}` objects via `hs.pasteboard.writeObjects` to register `public.file-url` so Finder can paste. If a future macOS changes this, it's the spot to revisit.
+- **Per-transfer staging dirs**: LOCAL uses `C:\clipsync-share\{incoming,outgoing}\<timestamp>\`; each REMOTE uses its own `incoming\<timestamp>\` (`%LOCALAPPDATA%\clipsync\incoming` on Windows, `~/.clipsync/incoming` on macOS). Avoids name collisions. LOCAL share pruned >7 days old on bridge start; REMOTE staging cleared on script start.
 
 ## Gotchas to remember
 
@@ -73,6 +92,10 @@ On Windows the clipboard is **per-window-station**. SSH-launched processes land 
 - `ssh host "command"` joins remaining args via the remote shell; quotes in the local shell get stripped before transmission. Use `-EncodedCommand` for any PS script with metacharacters.
 - AutoHotkey strings are UTF-16 internally; `StrPtr(s)` gives a pointer to the raw UTF-16 buffer, which we copy directly for `EncodeUtf16Base64` rather than fighting `StrPut`'s null-terminator semantics.
 - curl.exe at C:\Windows\System32\curl.exe is on PATH in SSH sessions on Windows 11. Don't worry about pathing.
+- **Non-admin `authorized_keys` location — use ProgramData + a Match block, NOT the profile.** A dedicated SSH account that never logs in interactively has **no Windows profile** (empty `ProfileImagePath`), so sshd can't resolve `$HOME` to find a home-relative `.ssh\authorized_keys` and silently falls back to password. Fix: put the key at `C:\ProgramData\ssh\clipsync_authorized_keys` and add `Match User clipsync` / `AuthorizedKeysFile __PROGRAMDATA__/ssh/clipsync_authorized_keys` to `sshd_config`, then restart sshd. This mirrors the box's existing `k3sbackup`/`mediabackup`/`authentikbackup` accounts. ACLs: inheritance off, owner + access only SYSTEM + Administrators (sshd reads as SYSTEM; the account itself needs no access). A BOM in the key file or `sshd_config` breaks parsing — write ASCII. `setup-ssh-account.ps1` section 7 does all this idempotently and validates with `sshd -t` before restarting.
+- **Blank-password accounts can't do network logon**: `clipsync` gets a random password (not `-NoPassword`), else the default "limit blank-password use to console" policy blocks SSH.
+- **DefaultShell is machine-wide**: `HKLM:\SOFTWARE\OpenSSH\DefaultShell` applies to all SSH logins, so `clipsync` inherits PowerShell and `curl.exe`/`-EncodedCommand` work the same as for `admin`.
+- **macOS remote command quoting**: `clipsync.lua` passes the whole remote command as one sh-quoted arg to `ssh`, and single-quotes `'@-'` inside it so remote PowerShell treats it literally. POST bodies stream via `ssh ... < file` (curl `@-` reads stdin) — no scp of body files, no LOCAL temp path to resolve.
 
 ## Verification
 

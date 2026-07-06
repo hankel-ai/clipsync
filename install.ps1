@@ -15,7 +15,9 @@
 [CmdletBinding()]
 param(
     [string]$LocalSshHost,                  # e.g. 192.168.1.50 or local-pc.lan
-    [string]$LocalSshUser = $env:USERNAME,  # account on LOCAL
+    [string]$LocalSshUser = 'clipsync',     # dedicated low-privilege SSH account on LOCAL
+                                            #   (see setup-ssh-account.ps1). Was the desktop
+                                            #   admin user; now a separate SSH-only account.
     [string]$LocalSshKey,                   # path to private key on REMOTE
     [string]$AhkVersion = "2.0.26",         # bump as needed
     [switch]$SkipSshConfig
@@ -147,6 +149,9 @@ if ($test.ExitCode -eq 0 -and $out -match 'clipsync-ok') {
     Warn "SSH test failed (exit $($test.ExitCode))."
     if ($err) { Warn "stderr: $($err.Trim())" }
     Warn "Fix ssh config / key auth before launching clipsync.ahk."
+    Warn "REMOTE now logs into LOCAL as the '$LocalSshUser' account (not admin)."
+    Warn "On LOCAL, authorize THIS machine's public key:"
+    Warn "  powershell -File .\setup-ssh-account.ps1 -AddKeyOnly <paste id_ed25519.pub line>"
 }
 
 Info "Pinging the LOCAL clipsync-bridge via SSH (10s timeout)..."

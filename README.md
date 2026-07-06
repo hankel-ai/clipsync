@@ -1,15 +1,22 @@
 # clipsync
 
-Two-way clipboard + file/folder sync between two Windows 11 machines, driven by hotkeys on **REMOTE**. Designed for the case where you access REMOTE through PIKVM in a browser and can't paste between LOCAL and REMOTE.
+Two-way clipboard + file/folder sync between a **LOCAL** Windows machine and one or more **REMOTE** machines, driven by hotkeys on REMOTE. Designed for the case where you reach REMOTE through a browser-based remote desktop that can't move files:
+
+- **Windows REMOTE** via PIKVM (hotkeys via AutoHotkey)
+- **macOS REMOTE** via Chrome Remote Desktop (hotkeys via Hammerspoon) — adds the file transfer CRD lacks
+
+REMOTE logs into LOCAL as a dedicated **low-privilege `clipsync` SSH account** (not your admin desktop user). See [SSH account setup](#ssh-account-setup-one-time-on-local).
 
 ## Hotkeys
 
-| Hotkey | Action |
-|---|---|
-| `Ctrl+Alt+Win+V` | Pull LOCAL clipboard onto REMOTE and auto-paste (Ctrl+V) |
-| `Ctrl+Alt+Win+C` | Auto-copy (Ctrl+C) on REMOTE, then push clipboard to LOCAL |
+| Windows REMOTE | macOS REMOTE | Action |
+|---|---|---|
+| `Ctrl+Alt+Win+V` | `Ctrl+Alt+Cmd+V` | Pull LOCAL clipboard onto REMOTE and auto-paste |
+| `Ctrl+Alt+Win+C` | `Ctrl+Alt+Cmd+C` | Auto-copy on REMOTE, then push clipboard to LOCAL |
 
-Both hotkeys handle plain text **and** Explorer file/folder selections (CF_HDROP). The auto Ctrl+C / Ctrl+V makes the workflow seamless — just select and press the hotkey.
+Both hotkeys handle plain text, images, **and** file/folder selections (Explorer CF_HDROP on Windows, Finder selection on macOS). The auto copy/paste makes the workflow seamless — just select and press the hotkey.
+
+> **macOS + Chrome Remote Desktop caveat:** CRD is picky about forwarding modifier combos (the local Windows OS can swallow Win-key combos; CRD remaps Win→Cmd). `Ctrl+Alt+Cmd+V/C` is the default; if CRD won't forward it, change the `MODS`/`KEY_*` lines near the top of `clipsync.lua` (e.g. to an F-key).
 
 ## Topology
 
@@ -30,7 +37,7 @@ Why a bridge on LOCAL? On Windows the clipboard is **per-window-station**. SSH-l
 
 ## File locations
 
-### REMOTE
+### REMOTE (Windows)
 
 | Path | Purpose |
 |---|---|
@@ -40,13 +47,23 @@ Why a bridge on LOCAL? On Windows the clipboard is **per-window-station**. SSH-l
 | `%LOCALAPPDATA%\clipsync\incoming\` | Staging folder for files pulled from LOCAL (cleared on startup) |
 | `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\clipsync.lnk` | Auto-start shortcut |
 
+### REMOTE (macOS)
+
+| Path | Purpose |
+|---|---|
+| `~/.hammerspoon/clipsync.lua` | Hotkey driver (loaded via `require("clipsync")` in `init.lua`) |
+| `~/.clipsync/clipsync.log` | REMOTE-side log |
+| `~/.clipsync/incoming/` | Staging folder for files pulled from LOCAL (cleared on startup) |
+| Hammerspoon auto-starts at login (its own "Launch at login" setting) | Auto-start |
+
 ### LOCAL
 
 | Path | Purpose |
 |---|---|
 | `%LOCALAPPDATA%\clipsync\clipsync-bridge.ps1` | Clipboard bridge script |
 | `%LOCALAPPDATA%\clipsync\clipsync-bridge.log` | LOCAL-side log (every HTTP request) |
-| `%LOCALAPPDATA%\clipsync\incoming\` | Staging folder for files pushed from REMOTE (cleared on startup) |
+| `C:\clipsync-share\incoming\` | Files/images pushed **from** REMOTE (both accounts can read/write) |
+| `C:\clipsync-share\outgoing\` | Files/images the bridge stages **for** REMOTE to pull |
 | `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\clipsync-bridge.lnk` | Auto-start shortcut |
 
 ### Source / development
@@ -63,142 +80,119 @@ Why a bridge on LOCAL? On Windows the clipboard is **per-window-station**. SSH-l
 
 ## Requirements
 
-- **REMOTE**: Windows 11, OpenSSH client (default). **No admin rights needed.**
-- **LOCAL**: Windows 11, OpenSSH **server** running, with key-based auth set up so REMOTE can SSH in without a password. PowerShell 5.1 (default). Admin needed once on LOCAL to install/enable OpenSSH Server; the rest of clipsync needs no admin on either side.
+- **REMOTE (Windows)**: Windows 11, OpenSSH client (default). **No admin rights needed.**
+- **REMOTE (macOS)**: macOS, OpenSSH client (default), Hammerspoon (user-scope, no admin; Accessibility granted once). On the same LAN as LOCAL.
+- **LOCAL**: Windows 11, OpenSSH **server**, PowerShell 5.1 (default). Admin needed **once** to run `setup-ssh-account.ps1` (creates the `clipsync` SSH account, the shared staging dir, and enables sshd). After that, the bridge and everything else runs **as your normal desktop user, no elevation**.
 
-## SSH key setup (one-time)
+## SSH account setup (one-time, on LOCAL)
 
-If REMOTE can already do `ssh <user>@<local-host>` and land at a prompt without typing a password, skip this section.
+REMOTE logs into LOCAL as a dedicated **`clipsync`** account (SSH-only, non-admin), not your desktop admin user. This is provisioned once by an elevated script.
 
-### Step 0a - on LOCAL: enable OpenSSH Server (admin)
+### Step A - on LOCAL: run the setup script (admin)
 
-Open PowerShell **as Administrator**:
+Copy the `clipsync` folder to LOCAL, then in an **elevated** PowerShell:
 
-```powershell
-# Install + start the SSH server
-Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
-Start-Service sshd
-Set-Service -Name sshd -StartupType Automatic
-
-# Open the firewall (the install usually creates this rule, but verify)
-Get-NetFirewallRule -Name *ssh* | Format-Table Name,Enabled,Direction,Action
+```
+powershell -ExecutionPolicy Bypass -File .\setup-ssh-account.ps1
 ```
 
-Optional but recommended: set the SSH default shell to PowerShell so the install scripts and `curl.exe` calls in clipsync work as documented:
+It creates the `clipsync` user (random password, interactive/RDP logon denied), the shared staging dir `C:\clipsync-share` with ACLs for both your desktop user and `clipsync`, an empty `authorized_keys` with tight ACLs, and ensures OpenSSH Server is installed/running/firewalled with PowerShell as the default shell. You authorize each REMOTE's key in Step C.
 
-```powershell
-New-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShell `
-    -Value "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" `
-    -PropertyType String -Force
-```
+### Step B - on each REMOTE: generate a key
 
-### Step 0b - on REMOTE: generate a key
-
+**Windows REMOTE:**
 ```powershell
 ssh-keygen -t ed25519 -f $env:USERPROFILE\.ssh\id_ed25519 -C "clipsync-$env:COMPUTERNAME"
-```
-
-Press Enter twice to skip the passphrase (the key needs to be usable non-interactively from the AHK script). The public key lands at `%USERPROFILE%\.ssh\id_ed25519.pub`.
-
-> Use a Windows path with `-f` (`$env:USERPROFILE\.ssh\id_ed25519`), not `~/.ssh/...` — `~` is unreliable for ssh-keygen on Windows.
-
-Print the public key so you can copy it:
-
-```powershell
 type $env:USERPROFILE\.ssh\id_ed25519.pub
 ```
+> Use a Windows path with `-f`, not `~/.ssh/...` — `~` is unreliable for ssh-keygen on Windows. Press Enter twice (no passphrase; the key must work non-interactively).
 
-### Step 0c - on LOCAL: authorize the key
+**macOS REMOTE:** `install-mac.sh` (below) generates the key and prints the public line for you.
 
-This is the **important Windows-specific gotcha**: on Windows OpenSSH server, where you put the public key depends on whether the LOCAL user is an Administrator.
+### Step C - on LOCAL: authorize each REMOTE's key (admin)
 
-| LOCAL user is in... | `authorized_keys` file |
-|---|---|
-| Administrators group (typical home user) | `C:\ProgramData\ssh\administrators_authorized_keys` |
-| Standard user | `%USERPROFILE%\.ssh\authorized_keys` |
-
-If you put the key in the wrong file the login silently falls back to password and key auth never works.
-
-**For an Administrator user** (PowerShell as Administrator on LOCAL):
-
-```powershell
-# Paste the line from REMOTE here (one line, no trailing whitespace)
-$pubkey = 'ssh-ed25519 AAAA... clipsync-REMOTEHOSTNAME'
-
-$path = 'C:\ProgramData\ssh\administrators_authorized_keys'
-Add-Content -Path $path -Value $pubkey -Encoding ASCII
-
-# OpenSSH refuses to use the file unless ACLs are tight: only Admins + SYSTEM
-icacls $path /inheritance:r
-icacls $path /grant 'Administrators:F' 'SYSTEM:F'
-```
-
-**For a standard (non-admin) user on LOCAL**:
-
-```powershell
-$pubkey = 'ssh-ed25519 AAAA... clipsync-REMOTEHOSTNAME'
-
-$dir = "$env:USERPROFILE\.ssh"
-if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
-Add-Content -Path "$dir\authorized_keys" -Value $pubkey -Encoding ASCII
-```
-
-### Step 0d - on REMOTE: verify and add a Host alias
-
-```powershell
-ssh <local-user>@<local-ip-or-hostname> "hostname"
-```
-
-Should print LOCAL's hostname with no password prompt. If it asks for a password, the key isn't being used — double-check the file from Step 0c.
-
-The clipsync REMOTE installer (`install.ps1`) will add a `Host clipsync-local` block to `~/.ssh/config` for you when you pass `-LocalSshHost` and `-LocalSshUser`. If you want to do it manually, append to `%USERPROFILE%\.ssh\config`:
+Paste each REMOTE's **public** key line as trailing tokens — no quotes needed, works from cmd.exe or PowerShell:
 
 ```
-Host clipsync-local
-    HostName 192.168.1.50
-    User admin
-    IdentityFile ~/.ssh/id_ed25519
-    IdentitiesOnly yes
+powershell -File .\setup-ssh-account.ps1 -AddKeyOnly ssh-ed25519 AAAA... clipsync-REMOTEHOSTNAME
 ```
 
-Then `ssh clipsync-local "hostname"` should also succeed.
+Or run `-AddKeyOnly` with no key and paste the whole line when prompted (most foolproof — no arg-splitting). Either way it appends to `C:\ProgramData\ssh\clipsync_authorized_keys` (an absolute path wired via a `Match User clipsync` block in `sshd_config`) with the correct ACLs. Repeat for every REMOTE.
+
+> **Why ProgramData, not `C:\Users\clipsync\.ssh`?** A dedicated SSH account that never logs in interactively has no Windows profile, so `sshd` can't resolve its home directory to find a home-relative `authorized_keys` — key auth then silently falls back to password. The absolute `Match User` path fixes this. It mirrors the same pattern Windows uses for admin accounts (`administrators_authorized_keys`) and any other SSH-only service accounts on the box.
+
+### Step D - on REMOTE: verify
+
+```
+ssh clipsync@<local-ip> "hostname"
+```
+Should print LOCAL's hostname with no password prompt. (`install.ps1` / `install-mac.sh` create the `clipsync-local` Host alias for you.)
 
 ## Install
 
-### Step 1 - on LOCAL
+### Step 1 - on LOCAL (bridge)
 
-Copy the `clipsync` folder to LOCAL, then:
+After the SSH account setup above, still on LOCAL (no elevation needed):
 
 ```
 powershell -ExecutionPolicy Bypass -File .\install-local.ps1
 ```
 
-What it does (user-scope, no elevation):
+What it does (user-scope, runs the bridge as **your** desktop user):
 
 1. Copies `clipsync-bridge.ps1` to `%LOCALAPPDATA%\clipsync\`
-2. Drops a Startup shortcut so the bridge auto-starts at every login
+2. Drops a Startup shortcut (passing `-ShareDir C:\clipsync-share`) so the bridge auto-starts at login
 3. Launches the bridge now and pings `http://127.0.0.1:8765/ping`
 
 You should see "Bridge responded to /ping. Install complete." and a green sync icon in the system tray.
 
-### Step 2 - on REMOTE
+### Step 2a - on a Windows REMOTE
 
 Copy the `clipsync` folder to REMOTE, then (single line works in cmd or PowerShell):
 
 ```
-powershell -ExecutionPolicy Bypass -File .\install.ps1 -LocalSshHost 192.168.1.50 -LocalSshUser admin
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -LocalSshHost 192.168.1.50
 ```
 
-Pass `-LocalSshKey <path>` to pin a specific private key, or `-SkipSshConfig` if you've already got a `Host clipsync-local` block in `~/.ssh/config`.
+`-LocalSshUser` defaults to `clipsync`. Pass `-LocalSshKey <path>` to pin a key, or `-SkipSshConfig` if you already have a `Host clipsync-local` block.
 
 What it does (user-scope, no elevation):
 
-1. Downloads AutoHotkey v2.0.26 portable .zip and extracts to `%LOCALAPPDATA%\AHK\`
+1. Downloads AutoHotkey v2.0.26 portable and extracts to `%LOCALAPPDATA%\AHK\`
 2. Drops `clipsync.ahk` at `%LOCALAPPDATA%\clipsync\clipsync.ahk`
 3. Creates a Startup shortcut so it auto-runs at login
-4. Adds a `Host clipsync-local` block to `~/.ssh/config` (skipped if one exists)
+4. Adds a `Host clipsync-local` block (`User clipsync`) to `~/.ssh/config`
 5. Smoke-tests SSH and the bridge `/ping` endpoint
 6. Launches the script
+
+### Step 2b - on a macOS REMOTE
+
+Copy the `clipsync` folder to the Mac, then:
+
+```
+chmod +x install-mac.sh
+./install-mac.sh --local-host 192.168.1.50
+```
+
+What it does (user-scope, no admin):
+
+1. Installs Hammerspoon (via Homebrew if present, else prompts you to drag the app in)
+2. Places `clipsync.lua` at `~/.hammerspoon/clipsync.lua` and `require`s it from `init.lua`
+3. Generates `~/.ssh/id_ed25519` if needed and **prints the public key** for Step C
+4. Adds a `Host clipsync-local` block (`User clipsync`) to `~/.ssh/config`
+5. Reminds you to grant Hammerspoon **Accessibility** (System Settings → Privacy & Security → Accessibility) — required for global hotkeys and auto-paste
+6. Smoke-tests the bridge `/ping`
+
+After granting Accessibility, reload Hammerspoon's config (menu-bar icon → Reload Config).
+
+## Migrating an existing setup off the `admin` login
+
+If you were running clipsync with REMOTE logging in as `admin`:
+
+1. Run `setup-ssh-account.ps1` on LOCAL and authorize each REMOTE's existing key (Step C).
+2. On each Windows REMOTE, change the `clipsync-local` block in `~/.ssh/config` to `User clipsync` (or rerun `install.ps1`).
+3. Verify `ssh clipsync-local "hostname"` works from every REMOTE.
+4. **Remove `admin`'s key** from `C:\ProgramData\ssh\administrators_authorized_keys` — `admin` is then no longer SSH-reachable.
 
 ## Updating after code changes
 
@@ -235,12 +229,15 @@ Should print `pong`. Then:
 | pull files | select files in LOCAL Explorer &rarr; Ctrl+C &rarr; Ctrl+Alt+Win+V on REMOTE &rarr; auto-pastes in Explorer |
 | push files | select files in REMOTE Explorer &rarr; Ctrl+Alt+Win+C &rarr; auto-copies then pushes to LOCAL &rarr; Ctrl+V on LOCAL |
 
-A tooltip near the cursor on REMOTE confirms success/failure for each transfer. For large file transfers, the tooltip persists until the operation completes.
+A tooltip near the cursor on a Windows REMOTE (or an on-screen `hs.alert` on macOS) confirms success/failure for each transfer. For large transfers it persists until the operation completes.
+
+On a **macOS REMOTE** the hotkeys are `Ctrl+Alt+Cmd+V/C`, and the file tests use the **Finder selection** instead of an Explorer copy: select files in Finder, press `Ctrl+Alt+Cmd+C` to push; press `Ctrl+Alt+Cmd+V` in a Finder window to pull + paste.
 
 ## Troubleshooting
 
 Logs:
-- REMOTE: `%LOCALAPPDATA%\clipsync\clipsync.log` (every command run, exit code, stderr snippet)
+- REMOTE (Windows): `%LOCALAPPDATA%\clipsync\clipsync.log` (every command run, exit code, stderr snippet)
+- REMOTE (macOS): `~/.clipsync/clipsync.log`
 - LOCAL: `%LOCALAPPDATA%\clipsync\clipsync-bridge.log` (every HTTP request)
 
 Common failures:
@@ -255,18 +252,22 @@ Common failures:
 
 ## Staging folders
 
-Both machines use `%LOCALAPPDATA%\clipsync\incoming\` as a staging area for file transfers. Each transfer creates a timestamped subfolder (e.g. `20260504-152206\`). All staging folders are **cleared automatically on startup** — the files are always copies, originals are never moved or deleted.
+File/image transfers are staged, never moved — originals are always left untouched.
+
+- **LOCAL**: `C:\clipsync-share\{incoming,outgoing}\<timestamp>\`. This shared dir is how payloads cross between the non-admin `clipsync` SSH account (which runs `scp`) and your desktop user (which runs the bridge). Subfolders older than 7 days are pruned when the bridge starts.
+- **REMOTE**: its own `incoming\<timestamp>\` (`%LOCALAPPDATA%\clipsync\incoming` on Windows, `~/.clipsync/incoming` on macOS), **cleared on startup**.
 
 ## Uninstall
 
-On REMOTE:
+On a Windows REMOTE:
 ```
 powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
 ```
-
 Flags: `-RemoveAhk`, `-RemoveStaging`, `-RemoveSshConfig`.
 
-On LOCAL: right-click tray icon &rarr; Exit, then delete `%LOCALAPPDATA%\clipsync\` and the Startup shortcut at `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\clipsync-bridge.lnk`.
+On a macOS REMOTE: remove the `require("clipsync")` line from `~/.hammerspoon/init.lua`, delete `~/.hammerspoon/clipsync.lua` and `~/.clipsync/`, reload Hammerspoon (or quit it).
+
+On LOCAL: right-click tray icon &rarr; Exit, then delete `%LOCALAPPDATA%\clipsync\` and the Startup shortcut at `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\clipsync-bridge.lnk`. To also remove the SSH account (elevated): `Remove-LocalUser clipsync`, delete `C:\clipsync-share` and `C:\ProgramData\ssh\clipsync_authorized_keys`, and remove the `Match User clipsync` block from `C:\ProgramData\ssh\sshd_config` (then `Restart-Service sshd`).
 
 ## Notes
 

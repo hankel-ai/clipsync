@@ -13,7 +13,8 @@
 [CmdletBinding()]
 param(
     [string]$Bind = '127.0.0.1',
-    [int]$Port = 8765
+    [int]$Port = 8765,
+    [string]$ShareDir = 'C:\clipsync-share'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -31,6 +32,15 @@ $installDir = Join-Path $env:LOCALAPPDATA 'clipsync'
 $bridgeDst  = Join-Path $installDir 'clipsync-bridge.ps1'
 $startupDir = [Environment]::GetFolderPath('Startup')
 $lnkPath    = Join-Path $startupDir 'clipsync-bridge.lnk'
+
+# 0. Warn if the shared staging dir hasn't been provisioned with ACLs yet.
+#    The bridge will create it on first run, but WITHOUT the ACLs the SSH
+#    account needs - run setup-ssh-account.ps1 (elevated) for that.
+if (-not (Test-Path $ShareDir)) {
+    Warn "Shared staging dir '$ShareDir' does not exist yet."
+    Warn "Run setup-ssh-account.ps1 (elevated) first so it gets the right ACLs,"
+    Warn "otherwise file/image transfer over the non-admin SSH account will fail."
+}
 
 # 1. Copy script into place
 New-Item -ItemType Directory -Force -Path $installDir | Out-Null
@@ -50,7 +60,7 @@ $psExe = (Get-Command powershell.exe).Source
 $ws = New-Object -ComObject WScript.Shell
 $lnk = $ws.CreateShortcut($lnkPath)
 $lnk.TargetPath       = $psExe
-$lnk.Arguments        = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Sta -File `"$bridgeDst`" -Bind $Bind -Port $Port"
+$lnk.Arguments        = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Sta -File `"$bridgeDst`" -Bind $Bind -Port $Port -ShareDir `"$ShareDir`""
 $lnk.WorkingDirectory = $installDir
 $lnk.WindowStyle      = 7   # minimized (also hidden by -WindowStyle Hidden)
 $lnk.Description      = "clipsync clipboard bridge for REMOTE access"
@@ -65,7 +75,8 @@ Start-Process -FilePath $psExe `
         '-ExecutionPolicy', 'Bypass', '-Sta',
         '-File', $bridgeDst,
         '-Bind', $Bind,
-        '-Port', $Port
+        '-Port', $Port,
+        '-ShareDir', $ShareDir
     ) `
     -WindowStyle Hidden | Out-Null
 
