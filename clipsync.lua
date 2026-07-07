@@ -117,6 +117,34 @@ local function sshRun(remoteCmd)
     return runCmd("ssh " .. q(SSH_HOST) .. " " .. q(remoteCmd))
 end
 
+-- Base64 of raw bytes (table of 0-255). No external deps.
+local B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+local function base64(bytes)
+    local out = {}
+    for i = 1, #bytes, 3 do
+        local b1, b2, b3 = bytes[i], bytes[i + 1], bytes[i + 2]
+        local n = b1 * 65536 + (b2 or 0) * 256 + (b3 or 0)
+        out[#out + 1] = B64:sub(math.floor(n / 262144) % 64 + 1, math.floor(n / 262144) % 64 + 1)
+        out[#out + 1] = B64:sub(math.floor(n / 4096)  % 64 + 1, math.floor(n / 4096)  % 64 + 1)
+        out[#out + 1] = b2 and B64:sub(math.floor(n / 64) % 64 + 1, math.floor(n / 64) % 64 + 1) or '='
+        out[#out + 1] = b3 and B64:sub(n % 64 + 1, n % 64 + 1) or '='
+    end
+    return table.concat(out)
+end
+
+-- Run a PowerShell command on LOCAL via -EncodedCommand (base64 of UTF-16LE).
+-- This is quoting-proof: the payload survives ssh -> sshd -> PowerShell with no
+-- shell-metachar hazards. Same rationale as clipsync.ahk's SshPs/-EncodedCommand.
+-- (Our commands are ASCII, so one 0x00 high byte per char is a correct UTF-16LE.)
+local function sshPwsh(psInner)
+    local bytes = {}
+    for i = 1, #psInner do
+        bytes[#bytes + 1] = psInner:byte(i)
+        bytes[#bytes + 1] = 0
+    end
+    return sshRun("powershell -NoProfile -EncodedCommand " .. base64(bytes))
+end
+
 local function sshGet(path)
     return sshRun("curl.exe -s -m " .. HTTP_TIMEOUT .. " " .. BRIDGE_URL .. path)
 end
@@ -141,22 +169,14 @@ local function sshPost(bodyFile, endpoint)
                    " -H 'Content-Type:text/plain;charset=utf-8' " .. BRIDGE_URL .. endpoint
     local res = runCmd("ssh " .. q(SSH_HOST) .. " " .. q(remote))
 
-    -- Best-effort cleanup of the LOCAL temp body file.
-    runCmd("ssh " .. q(SSH_HOST) .. " " ..
-           q("powershell -NoProfile -Command \"Remove-Item -LiteralPath '" ..
-             remotePath .. "' -Force -ErrorAction SilentlyContinue\""))
+    -- Best-effort cleanup of the LOCAL temp body file (quoting-proof via sshPwsh).
+    sshPwsh("Remove-Item -LiteralPath '" .. remotePath .. "' -Force -ErrorAction SilentlyContinue")
     return res
 end
 
 -- The bridge returns "ok" on a successful POST. Treat anything else as failure.
 local function responseOk(res)
     return trim(res.stdout) == "ok"
-end
-
--- Run a PowerShell one-liner on LOCAL (filesystem ops; no clipboard needed).
--- Paths are single-quoted for PowerShell; the whole thing is one ssh arg.
-local function sshPwsh(psInner)
-    return sshRun("powershell -NoProfile -Command " .. q(psInner))
 end
 
 -- === Mac clipboard / Finder ================================================
