@@ -121,13 +121,31 @@ local function sshGet(path)
     return sshRun("curl.exe -s -m " .. HTTP_TIMEOUT .. " " .. BRIDGE_URL .. path)
 end
 
--- POST the contents of a local file to <bridge><endpoint> via curl reading
--- stdin (@-). ssh forwards our stdin to the remote curl - no temp file on LOCAL.
--- The '@-' is single-quoted so remote PowerShell treats it literally.
+-- POST the contents of a local file to <bridge><endpoint>.
+--
+-- We do NOT pipe the body over ssh stdin: LOCAL's default shell is PowerShell,
+-- and stdin fed to `ssh host "cmd" < file` is NOT reliably delivered to a
+-- child curl.exe under PowerShell - it arrives empty, so POST /text silently
+-- clears the clipboard while the bridge still answers "ok". Instead we scp the
+-- body up to the LOCAL shared dir and have curl.exe read it as a file (@path),
+-- exactly like clipsync.ahk's ScpThenPost. Then we delete the LOCAL temp file.
 local function sshPost(bodyFile, endpoint)
+    local remotePath = LOCAL_SHARE .. [[\incoming\clipsync_body_]] ..
+                       os.date("%Y%m%d-%H%M%S") .. "-" .. nextSeq() .. ".bin"
+    local scp = runCmd("scp -q " .. q(bodyFile) .. " " .. q(SSH_HOST .. ":" .. remotePath))
+    if scp.exit ~= 0 then return scp end
+
+    -- '@path' single-quoted so remote PowerShell passes it literally to curl.exe.
     local remote = "curl.exe -s -m " .. HTTP_TIMEOUT ..
-                   " -X POST --data-binary '@-' " .. BRIDGE_URL .. endpoint
-    return runCmd("ssh " .. q(SSH_HOST) .. " " .. q(remote) .. " < " .. q(bodyFile))
+                   " -X POST --data-binary '@" .. remotePath .. "'" ..
+                   " -H 'Content-Type:text/plain;charset=utf-8' " .. BRIDGE_URL .. endpoint
+    local res = runCmd("ssh " .. q(SSH_HOST) .. " " .. q(remote))
+
+    -- Best-effort cleanup of the LOCAL temp body file.
+    runCmd("ssh " .. q(SSH_HOST) .. " " ..
+           q("powershell -NoProfile -Command \"Remove-Item -LiteralPath '" ..
+             remotePath .. "' -Force -ErrorAction SilentlyContinue\""))
+    return res
 end
 
 -- The bridge returns "ok" on a successful POST. Treat anything else as failure.
