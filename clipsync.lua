@@ -110,6 +110,30 @@ local function sendCmd(letter)
     hs.eventtap.keyStroke({"cmd"}, letter, 0)
 end
 
+-- Wait (bounded) for the user to release the hotkey modifiers before we
+-- synthesize a keystroke. Without this, a push's Cmd+C fires while Ctrl+Alt+Cmd
+-- is still physically held, so the app sees Ctrl+Alt+Cmd+C (not a clean copy)
+-- and nothing is copied - the push then reads stale clipboard contents. (Pull's
+-- Cmd+V doesn't need this: it fires ~1s later, after ssh, once the user let go.)
+local function waitModifiersReleased(maxMs)
+    local waited = 0
+    while waited < maxMs do
+        local m = hs.eventtap.checkKeyboardModifiers()
+        if not (m.cmd or m.ctrl or m.alt or m.shift) then return end
+        hs.timer.usleep(15000)
+        waited = waited + 15
+    end
+end
+
+-- Build an scp remote source spec from a Windows path. macOS scp runs a remote
+-- glob on the SOURCE and mangles backslashes, so a path that exists still errors
+-- "No such file or directory". Forward slashes resolve fine on the Windows
+-- OpenSSH sftp server and aren't glob metacharacters. (Destinations aren't
+-- globbed, so push paths are left as-is.)
+local function scpRemote(winPath)
+    return SSH_HOST .. ":" .. (winPath:gsub("\\", "/"))
+end
+
 -- === Bridge transport (HTTP via SSH + curl.exe on LOCAL) ===================
 -- LOCAL's SSH default shell is PowerShell, so we call curl.exe (not curl) and
 -- keep the remote command as a single sh-quoted argument to ssh.
@@ -264,7 +288,7 @@ local function pullFiles()
     persistTip("Copying " .. #paths .. " item(s) from LOCAL...")
     local ok, fail = 0, 0
     for _, p in ipairs(paths) do
-        local scp = runCmd("scp -r -q " .. q(SSH_HOST .. ":" .. p) .. " " .. q(stage))
+        local scp = runCmd("scp -r -q " .. q(scpRemote(p)) .. " " .. q(stage))
         if scp.exit == 0 then ok = ok + 1 else fail = fail + 1; log("scp pull failed for " .. p .. ": " .. scp.stderr) end
     end
     hs.alert.closeAll()
@@ -284,7 +308,7 @@ local function pullImage()
 
     local stage = makeStagingDir()
     persistTip("Pulling image from LOCAL...")
-    local scp = runCmd("scp -q " .. q(SSH_HOST .. ":" .. localPath) .. " " .. q(stage))
+    local scp = runCmd("scp -q " .. q(scpRemote(localPath)) .. " " .. q(stage))
     hs.alert.closeAll()
     if scp.exit ~= 0 then tip("scp pull image failed: " .. trim(scp.stderr), true); return end
 
@@ -395,6 +419,9 @@ function M.pushToLocal()
         if #sel > 0 then pushFiles(sel); return end
     end
     -- Otherwise copy the current selection and inspect the pasteboard.
+    -- Wait for the hotkey modifiers to release first, else Cmd+C merges with the
+    -- still-held Ctrl+Alt+Cmd and no copy happens (we'd push stale clipboard).
+    waitModifiersReleased(600)
     sendCmd("c")
     hs.timer.usleep(300000)
     if hs.pasteboard.readImage() ~= nil then
