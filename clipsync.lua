@@ -21,6 +21,10 @@ local SSH_HOST     = "clipsync-local"                 -- ssh config alias
 local BRIDGE_URL   = "http://127.0.0.1:8765"          -- bridge on LOCAL loopback
 local LOCAL_SHARE  = [[C:\clipsync-share]]            -- shared staging dir ON LOCAL (Windows path)
 local HTTP_TIMEOUT = 15                               -- curl -m seconds
+-- GET /files makes the bridge copy every selected item (recursively) into the
+-- share BEFORE it responds, so many/large folders can exceed the default 15s
+-- cap and curl aborts the whole pull. Give that call a much longer budget.
+local HTTP_TIMEOUT_FILES = 120
 local ALERT_SECS   = 2.5
 
 local HOME         = os.getenv("HOME")
@@ -169,8 +173,8 @@ local function sshPwsh(psInner)
     return sshRun("powershell -NoProfile -EncodedCommand " .. base64(bytes))
 end
 
-local function sshGet(path)
-    return sshRun("curl.exe -s -m " .. HTTP_TIMEOUT .. " " .. BRIDGE_URL .. path)
+local function sshGet(path, timeout)
+    return sshRun("curl.exe -s -m " .. (timeout or HTTP_TIMEOUT) .. " " .. BRIDGE_URL .. path)
 end
 
 -- POST the contents of a local file to <bridge><endpoint>.
@@ -276,7 +280,7 @@ local function pullText()
 end
 
 local function pullFiles()
-    local res = sshGet("/files")
+    local res = sshGet("/files", HTTP_TIMEOUT_FILES)
     if res.exit ~= 0 then tip("GET /files failed: " .. trim(res.stderr), true); return end
     local paths = {}
     for line in res.stdout:gmatch("[^\r\n]+") do

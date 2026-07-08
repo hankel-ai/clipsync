@@ -35,6 +35,10 @@ LOCAL_SHARE    := "C:\clipsync-share"
 LOG_PATH       := EnvGet("LOCALAPPDATA") "\clipsync\clipsync.log"
 TRAY_MS        := 2500
 HTTP_TIMEOUT_S := 15
+; GET /files makes the bridge copy every selected item (recursively) into the
+; share BEFORE it responds, so many/large folders can blow past the default
+; 15s cap and curl aborts the whole pull. Give that call a much longer budget.
+HTTP_TIMEOUT_FILES_S := 120
 PS_UTF8        := "[Console]::OutputEncoding=[Text.Encoding]::UTF8;[Console]::InputEncoding=[Text.Encoding]::UTF8;"
 
 AHK_EXE        := EnvGet("LOCALAPPDATA") "\AHK\AutoHotkey64.exe"
@@ -117,7 +121,7 @@ PullText() {
 }
 
 PullFiles() {
-    res := SshGet("/files")
+    res := SshGet("/files", HTTP_TIMEOUT_FILES_S)
     if (res.exitCode != 0) {
         Tip("GET /files failed: " Trim(res.stderr), true)
         return
@@ -345,8 +349,10 @@ PushImage() {
 ; The remote default shell is PowerShell, so:
 ;   - 'curl' is an alias for Invoke-WebRequest -> use 'curl.exe' to bypass.
 ;   - URL contains no PS metachars so unquoted is fine.
-SshGet(path) {
-    cmd := 'ssh ' SSH_HOST ' curl.exe -s -m ' HTTP_TIMEOUT_S ' ' BRIDGE_URL path
+SshGet(path, timeout := 0) {
+    if (!timeout)
+        timeout := HTTP_TIMEOUT_S
+    cmd := 'ssh ' SSH_HOST ' curl.exe -s -m ' timeout ' ' BRIDGE_URL path
     return Run2(cmd)
 }
 
