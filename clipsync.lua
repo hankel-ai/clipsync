@@ -434,6 +434,35 @@ function M.pushToLocal()
     tip("Nothing to push (no Finder selection, image, or text).", true)
 end
 
+-- === Passthrough while a remote-desktop app is frontmost ===================
+-- When you're physically at this Mac with Microsoft Remote Desktop focused, the
+-- clipsync chord should go INTO the RDP session (macOS Cmd -> Windows key, so
+-- Ctrl+Alt+Cmd+V/C arrives in the guest as Ctrl+Alt+Win+V/C -> clipsync.ahk),
+-- not be swallowed here. A *disabled* hs.hotkey does not intercept the key, so
+-- macOS delivers it straight to the focused app. We toggle the two bindings on
+-- focus changes via an application watcher.
+--
+-- Find your bundle id with:  osascript -e 'id of app "Microsoft Remote Desktop"'
+-- (or hs.application.frontmostApplication():bundleID() in the Hammerspoon console
+--  while RDP is focused). Add whatever it returns below.
+local PASSTHROUGH_BUNDLES = {
+    ["com.microsoft.rdc.macos"] = true,   -- Microsoft Remote Desktop v10 / Windows App
+    ["com.microsoft.rdc.osx"]   = true,   -- older builds
+}
+
+local function updateHotkeyState(app)
+    if not (M._hkPull and M._hkPush) then return end
+    local bid = app and app:bundleID()
+    local passthrough = bid ~= nil and PASSTHROUGH_BUNDLES[bid] == true
+    if passthrough then
+        M._hkPull:disable(); M._hkPush:disable()
+    else
+        M._hkPull:enable();  M._hkPush:enable()
+    end
+    log("hotkeys " .. (passthrough and ("DISABLED (passthrough to " .. bid .. ")") or "enabled")
+        .. " frontmost=" .. tostring(bid))
+end
+
 -- === Startup ===============================================================
 local function clearStaging()
     if hs.fs.attributes(STAGING_BASE) then
@@ -447,6 +476,17 @@ function M.start()
     clearStaging()
     M._hkPull = hs.hotkey.bind(MODS, KEY_PULL, M.pullFromLocal)
     M._hkPush = hs.hotkey.bind(MODS, KEY_PUSH, M.pushToLocal)
+
+    -- Disable our hotkeys while a remote-desktop app is frontmost so the chord
+    -- passes into the RDP session instead of being captured here.
+    M._appWatcher = hs.application.watcher.new(function(_, event, app)
+        if event == hs.application.watcher.activated then
+            updateHotkeyState(app)
+        end
+    end)
+    M._appWatcher:start()
+    updateHotkeyState(hs.application.frontmostApplication())  -- set initial state
+
     log("=== clipsync started (pull=" .. KEY_PULL .. " push=" .. KEY_PUSH .. ") ===")
     hs.alert.show("clipsync ready", 1.5)
 end
