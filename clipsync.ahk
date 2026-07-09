@@ -43,6 +43,7 @@ PS_UTF8        := "[Console]::OutputEncoding=[Text.Encoding]::UTF8;[Console]::In
 
 AHK_EXE        := EnvGet("LOCALAPPDATA") "\AHK\AutoHotkey64.exe"
 SCRIPT_PATH    := EnvGet("LOCALAPPDATA") "\clipsync\clipsync.ahk"
+CC_HANDOFF_PS1 := EnvGet("LOCALAPPDATA") "\clipsync\cc-handoff.ps1"
 STARTUP_LNK    := A_AppData "\Microsoft\Windows\Start Menu\Programs\Startup\clipsync.lnk"
 
 DirCreate(STAGING_BASE)
@@ -82,6 +83,49 @@ ToggleStartup(*) {
 ; --- Hotkeys ----------------------------------------------------------------
 ^!#v::PullFromLocal()
 ^!#c::PushToLocal()
+F7::CcHandoff()
+
+; ============================================================================
+;  cc-handoff: F7 hands the selected Explorer folder to LOCAL for Claude Code
+; ============================================================================
+CcHandoff() {
+    global CC_HANDOFF_PS1
+    path := GetCcHandoffSelection()
+    if (path = "") {
+        Tip("cc-handoff: select a folder in Explorer first.", true)
+        return
+    }
+    if (!DirExist(path)) {
+        Tip("cc-handoff: selection is not a folder.", true)
+        return
+    }
+    if (!FileExist(CC_HANDOFF_PS1)) {
+        Tip("cc-handoff: script missing at " CC_HANDOFF_PS1, true)
+        return
+    }
+    Log("cc-handoff F7 -> " path)
+    Run('powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' CC_HANDOFF_PS1 '" -Source "' path '"')
+}
+
+; Return the filesystem path of the first selected item in the active Explorer
+; window, or "" if the foreground window is not an Explorer window / nothing
+; is selected.
+GetCcHandoffSelection() {
+    hwnd := WinActive("A")
+    if (!hwnd)
+        return ""
+    for win in ComObject("Shell.Application").Windows {
+        try {
+            if (win.HWND = hwnd) {
+                sel := win.Document.SelectedItems
+                if (sel.Count >= 1)
+                    return sel.Item(0).Path
+                return ""
+            }
+        }
+    }
+    return ""
+}
 
 ; ============================================================================
 ;  Direction 1: LOCAL -> REMOTE

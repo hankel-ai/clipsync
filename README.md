@@ -18,6 +18,27 @@ Both hotkeys handle plain text, images, **and** file/folder selections (Explorer
 
 > **macOS + Chrome Remote Desktop caveat:** CRD is picky about forwarding modifier combos (the local Windows OS can swallow Win-key combos; CRD remaps Win→Cmd). `Ctrl+Alt+Cmd+V/C` is the default; if CRD won't forward it, change the `MODS`/`KEY_*` lines near the top of `clipsync.lua` (e.g. to an F-key).
 
+## F7 folder handoff (cc-handoff)
+
+On a **Windows REMOTE**, press **F7** with a folder selected in Explorer to hand
+that folder to LOCAL for a Claude Code session, then sync your edits back:
+
+1. F7 copies the folder's **git working set** to LOCAL via clipsync's transport,
+   into `C:\clipsync-share\incoming\<ts>\<name>`. Only git-tracked / not-ignored
+   files go — `.git/`, gitignored **secrets (`.env`)**, and build junk never leave
+   the laptop (the filter is `git ls-files` / `git check-ignore`, i.e. exact git
+   semantics).
+2. The staged path lands on **LOCAL's clipboard** — paste it into Claude Code on
+   LOCAL as the project folder.
+3. A console stays open on REMOTE with a **repeating** menu: **`[1]`** sync edits
+   back to the original folder (repeatable — keep developing and syncing), **`[2]`**
+   done. Sync-back overwrites changed/new files and propagates Claude's deletions,
+   but is scoped so it **never** touches `.git`, secrets, or anything outside the
+   files it sent.
+
+Requires clipsync installed (F7 rides its alias/account/share/bridge) and `git`
+on PATH. See `docs/superpowers/specs/2026-07-08-cc-handoff-design.md`.
+
 ## Topology
 
 ```
@@ -62,6 +83,7 @@ All scripts are **idempotent** — safe to re-run. Already had clipsync running 
 |---|---|
 | `%LOCALAPPDATA%\AHK\AutoHotkey64.exe` | AutoHotkey v2 portable runtime |
 | `%LOCALAPPDATA%\clipsync\clipsync.ahk` | Hotkey driver script |
+| `%LOCALAPPDATA%\clipsync\cc-handoff.ps1` | F7 folder-handoff script (push/sync-back) |
 | `%LOCALAPPDATA%\clipsync\clipsync.log` | REMOTE-side log (every command, exit codes, stderr) |
 | `%LOCALAPPDATA%\clipsync\incoming\` | Staging folder for files pulled from LOCAL (cleared on startup) |
 | `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\clipsync.lnk` | Auto-start shortcut |
@@ -92,8 +114,10 @@ All scripts are **idempotent** — safe to re-run. Already had clipsync running 
 | `setup-ssh-account.ps1` | **LOCAL, elevated, one-time.** Creates the `clipsync` account, shared dir, ProgramData `authorized_keys` + `Match` block, sshd. `-AddKeyOnly <pubkey>` to authorize a REMOTE's key. Idempotent. |
 | `clipsync-bridge.ps1` | Source for LOCAL bridge |
 | `install-local.ps1` | LOCAL bridge installer (+ auto-start shortcut) |
-| `clipsync.ahk` | Source for **Windows** REMOTE hotkey script |
-| `install.ps1` | **Windows** REMOTE installer |
+| `clipsync.ahk` | Source for **Windows** REMOTE hotkey script (incl. the F7 cc-handoff hotkey) |
+| `cc-handoff.ps1` | Source for the F7 folder-handoff (git-filtered push + repeatable sync-back). Copied to REMOTE by `install.ps1`. |
+| `cc-handoff.Tests.ps1` | Pester tests for cc-handoff's pure functions |
+| `install.ps1` | **Windows** REMOTE installer (also deploys `cc-handoff.ps1`) |
 | `restart-ahk.bat` | Copy updated `.ahk` to REMOTE AppData + restart AHK |
 | `uninstall.ps1` | **Windows** REMOTE uninstaller |
 | `clipsync.lua` | Source for **macOS** REMOTE hotkey daemon (Hammerspoon) |

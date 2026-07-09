@@ -26,6 +26,21 @@ Two transports:
 - **Clipboard read/write**: REMOTE runs `ssh local "curl http://127.0.0.1:8765/<endpoint>"`. The SSH session on LOCAL hits its own loopback, where the bridge (which is in the `admin` interactive session) handles the actual clipboard call. Works even though the SSH account is a *different* (non-admin) user — any local account can dial loopback.
 - **File payloads**: `scp -r` from REMOTE in either direction, staged through `C:\clipsync-share`. scp runs as the `clipsync` SSH account, which can't read `admin`'s profile, so all payloads go through the shared dir instead.
 
+## cc-handoff (F7) — folder handoff for Claude Code
+
+An **extension** of clipsync (Windows REMOTE only), not a separate project. `clipsync.ahk` has an `F7` hotkey (`CcHandoff` / `GetCcHandoffSelection`) that resolves the selected Explorer folder via COM and launches a console running **`cc-handoff.ps1`**. Reuses the `clipsync-local` alias, `clipsync` account, `C:\clipsync-share`, `scp`, and the bridge — no watcher, no new staging dir. Spec: `docs/superpowers/specs/2026-07-08-cc-handoff-design.md`; plan: `docs/superpowers/plans/2026-07-08-cc-handoff.md`.
+
+Flow: **push** the folder's git working set → `C:\clipsync-share\incoming\<ts>\<name>`, set LOCAL's clipboard to that path via bridge **`POST /text`** (paste into Claude Code), then a **repeating** `[1] sync-back / [2] done` menu.
+
+Key rules (all enforced by `cc-handoff.Tests.ps1`):
+- **git is the exact filter, never reimplemented.** Push set = `git ls-files --cached --others --exclude-standard`; sync-back drops newly-ignored files via `git check-ignore`. The **laptop is the git authority both directions** (LOCAL copy has no `.git`). Non-repo → all files except `.git/`.
+- **`.git/`, gitignored secrets (`.env`), build junk never transfer.**
+- **Never `robocopy /MIR`/`/PURGE` into the source**, and **not even `robocopy /E`** — its timestamp/size change-detection can silently skip a same-size content edit. `Copy-Changes` does a deterministic **per-file overwrite** (copy-only, never deletes). Deletions propagate **only** for paths in the manifest (the managed set), which **refreshes after each sync** so files added in later rounds also get their deletions propagated.
+- **`git check-ignore` is called with paths as ARGS (chunked), not `--stdin`** — PowerShell's pipeline appends a CR that breaks suffix patterns like `*.log`.
+- Bridge `POST /text` reuses clipsync's ScpThenPost pattern (scp a body file up, `curl.exe --data-binary '@file'` — never pipe the POST body over ssh stdin).
+
+`install.ps1` deploys `cc-handoff.ps1` alongside `clipsync.ahk` into `%LOCALAPPDATA%\clipsync`.
+
 ## The non-admin SSH account (`clipsync`) + shared staging dir
 
 REMOTE authenticates to LOCAL as a dedicated **`clipsync`** account (SSH-only: interactive/RDP logon denied), provisioned once by `setup-ssh-account.ps1` (elevated). The bridge still runs as `admin` in the desktop session. The tension is files: `scp` runs as `clipsync`, but the clipboard lives under `admin`. Resolution — a shared dir `C:\clipsync-share` (ACL: Modify for both `admin` and `clipsync`):
