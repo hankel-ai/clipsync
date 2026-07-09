@@ -259,9 +259,13 @@ function Invoke-Handoff {
     while ($true) {
         Write-Host ""
         Write-Host "  [1] Sync updates back to  $Source   (repeatable)"
-        Write-Host "  [2] Done / cancel (leave the copy in the share; pruned in 7 days)"
-        $choice = Read-Host "Choose"
-        if ($choice -ne '1') { Write-Host "cc-handoff: done." -ForegroundColor Yellow; break }
+        Write-Host "  [2] Done (leave the copy in the share; pruned in 7 days)"
+        $choice = (Read-Host "Choose 1 or 2").Trim()
+        if ($choice -eq '2') { Write-Host "cc-handoff: done." -ForegroundColor Yellow; break }
+        if ($choice -ne '1') {
+            Write-Host "  Enter 1 (sync) or 2 (done) - Enter alone won't do anything." -ForegroundColor Yellow
+            continue
+        }
 
         $pullBase = Join-Path $env:TEMP ("cchpull_" + [Guid]::NewGuid().ToString('N'))
         try {
