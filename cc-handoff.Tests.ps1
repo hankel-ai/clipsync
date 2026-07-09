@@ -100,6 +100,21 @@ Describe 'Copy-Changes' {
             Test-Path (Join-Path $to '.env')  | Should -BeTrue   # NOT purged
         } finally { Remove-Item -Recurse -Force $from,$to -ErrorAction SilentlyContinue }
     }
+
+    It 'recreates NEW directories, including empty ones' {
+        $from = Join-Path $env:TEMP ("cchfe_" + [Guid]::NewGuid().ToString('N'))
+        $to   = Join-Path $env:TEMP ("cchte_" + [Guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $from,$to | Out-Null
+        Set-Content (Join-Path $from 'New Text Document.txt') 'x' -Encoding ascii
+        New-Item -ItemType Directory -Force -Path (Join-Path $from 'New folder') | Out-Null           # empty
+        New-Item -ItemType Directory -Force -Path (Join-Path $from 'nested\deep') | Out-Null           # empty nested
+        try {
+            [void](Copy-Changes -From $from -To $to)
+            Test-Path (Join-Path $to 'New Text Document.txt') | Should -BeTrue
+            Test-Path (Join-Path $to 'New folder')            | Should -BeTrue   # empty dir must sync
+            Test-Path (Join-Path $to 'nested\deep')           | Should -BeTrue   # empty nested dir must sync
+        } finally { Remove-Item -Recurse -Force $from,$to -ErrorAction SilentlyContinue }
+    }
 }
 
 Describe 'Get-TreeRelPaths' {

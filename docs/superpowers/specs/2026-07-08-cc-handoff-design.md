@@ -105,6 +105,8 @@ cc-handoff.ps1 -Source "<src>"   (console window; REMOTE)
              git -C <src> check-ignore over the pulled tree, delete matches from <laptop temp>\<name>
         c. copy changes + new (non-ignored) files back, WITHOUT deleting anything:
              per-file overwrite of every pulled file onto "<src>" (copy-only; NO mirror/purge)
+             + recreate every directory in the pulled tree, INCLUDING empty ones
+             (a file-list copy alone would silently drop new empty folders)
         d. propagate ONLY managed deletions: for each relative path in `manifest`
              now MISSING from <laptop temp>\<name>, remove it from "<src>"
         e. manifest = every relative path now in <laptop temp>\<name>   (refresh)

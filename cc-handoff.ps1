@@ -76,6 +76,16 @@ function Copy-Changes {
     # only in the original (.git, secrets, build dirs) stay safe.
     $rels = @(Get-TreeRelPaths -Root $From)
     Copy-IncludeTree -Source $From -Files $rels -Dest $To
+    # The file-list copy skips EMPTY directories (Get-TreeRelPaths is files-only),
+    # so a new folder Claude created with no files would never sync. Replicate the
+    # full directory structure, including empty dirs.
+    $base = (Resolve-Path -LiteralPath $From).Path.TrimEnd('\')
+    foreach ($d in (Get-ChildItem -LiteralPath $base -Recurse -Directory -Force)) {
+        $target = Join-Path $To ($d.FullName.Substring($base.Length + 1))
+        if (-not (Test-Path -LiteralPath $target)) {
+            New-Item -ItemType Directory -Force -Path $target | Out-Null
+        }
+    }
     return $rels.Count
 }
 
