@@ -38,6 +38,8 @@ $ahkDir       = Join-Path $env:LOCALAPPDATA 'AHK'
 $ahkExe       = Join-Path $ahkDir 'AutoHotkey64.exe'
 $clipsyncDir  = Join-Path $env:LOCALAPPDATA 'clipsync'
 $clipsyncAhk  = Join-Path $clipsyncDir 'clipsync.ahk'
+$ccHandoffSrc = Join-Path $scriptDir 'cc-handoff.ps1'
+$ccHandoffDst = Join-Path $clipsyncDir 'cc-handoff.ps1'
 $startupDir   = [Environment]::GetFolderPath('Startup')
 $shortcutPath = Join-Path $startupDir 'clipsync.lnk'
 
@@ -81,6 +83,12 @@ if (Test-Path $ahkExe) {
 New-Item -ItemType Directory -Force -Path $clipsyncDir | Out-Null
 Copy-Item -Force $ahkSource $clipsyncAhk
 Info "Installed script at $clipsyncAhk"
+if (Test-Path $ccHandoffSrc) {
+    Copy-Item -Force $ccHandoffSrc $ccHandoffDst
+    Info "Installed cc-handoff at $ccHandoffDst"
+} else {
+    Warn "cc-handoff.ps1 not found next to install.ps1 - F7 handoff will be unavailable."
+}
 
 # ----------------------------------------------------------------------------
 # 3. Startup shortcut
