@@ -123,10 +123,11 @@ local function waitModifiersReleased(maxMs)
     local waited = 0
     while waited < maxMs do
         local m = hs.eventtap.checkKeyboardModifiers()
-        if not (m.cmd or m.ctrl or m.alt or m.shift) then return end
+        if not (m.cmd or m.ctrl or m.alt or m.shift) then return true end
         hs.timer.usleep(15000)
         waited = waited + 15
     end
+    return false  -- gave up; a Cmd+C sent now is seen as Ctrl+Alt+Cmd+C
 end
 
 -- Synthesize Cmd+C and wait (bounded) for the pasteboard to ACTUALLY change.
@@ -134,20 +135,79 @@ end
 -- image takes far longer than text) or ignores Cmd+C entirely, the pasteboard
 -- still holds the PREVIOUS payload - so a push would ship stale content while
 -- honestly reporting success. hs.pasteboard.changeCount() is the only reliable
--- "the copy landed" signal macOS gives us. Returns true if it incremented.
--- A false return is NOT fatal: the user may have deliberately copied before
+-- "the copy landed" signal macOS gives us.
+--
+-- A failed copy is NOT fatal: the user may have deliberately copied before
 -- pressing the hotkey (the Windows REMOTE's only mode), so we still push - the
 -- caller just labels the tip so a stale push can never look like a fresh one.
+--
+-- Returns ok, reason. On failure `reason` names the actual cause, because the
+-- three ways this fails need three different user actions:
+--   * no Accessibility  -> keyStroke is a silent no-op; grant it in Settings
+--   * modifiers held    -> let go of the hotkey faster (or raise the wait)
+--   * app ignored it    -> that app won't serve a synthetic Cmd+C; copy manually
 local function copyAndWait(maxMs)
-    local before = hs.pasteboard.changeCount()
+    -- Snapshot what is ALREADY on the pasteboard first. A synthetic Cmd+C can
+    -- destroy it: in Messages (and any app where a text field holds focus) the
+    -- copy applies to an EMPTY selection, and macOS then replaces the pasteboard
+    -- with nothing - wiping an image the user deliberately copied a moment
+    -- earlier. That is why "copy it myself, then hit the hotkey" failed too.
+    -- If the copy leaves us with nothing usable, we put the snapshot back.
+    local priorImage = hs.pasteboard.readImage()
+    local priorText  = hs.pasteboard.readString()
+    local hadPrior   = (priorImage ~= nil) or (priorText ~= nil and #priorText > 0)
+
+    local before   = hs.pasteboard.changeCount()
+    local acc      = hs.accessibilityState()
+    local released = waitModifiersReleased(600)
+    local app      = hs.application.frontmostApplication()
+    local appName  = (app and app:name()) or "?"
+
     sendCmd("c")
     local waited = 0
     while waited < maxMs do
         hs.timer.usleep(25000)
         waited = waited + 25
-        if hs.pasteboard.changeCount() ~= before then return true end
+        if hs.pasteboard.changeCount() ~= before then
+            -- The pasteboard changed - but "changed to empty" is the Messages
+            -- trap, and pushing that would clear LOCAL's clipboard. Restore.
+            --
+            -- changeCount can bump BEFORE the app has written the data (it is
+            -- declared first, served lazily), so a read here can see a
+            -- transient empty on a perfectly good copy. Give it a grace period
+            -- and only call it empty if it STAYS empty - otherwise we would
+            -- "restore" over the very copy the user just made.
+            local nowImage, nowText
+            local grace = 0
+            repeat
+                nowImage = hs.pasteboard.readImage()
+                nowText  = hs.pasteboard.readString()
+                if nowImage ~= nil or (nowText ~= nil and #nowText > 0) then break end
+                hs.timer.usleep(25000)
+                grace = grace + 25
+            until grace >= 400
+            if nowImage == nil and (nowText == nil or #nowText == 0) then
+                if hadPrior then
+                    if priorImage then hs.pasteboard.writeObjects(priorImage)
+                    else               hs.pasteboard.setContents(priorText) end
+                    log(string.format("copy WIPED pasteboard (%s, empty selection) - restored prior", appName))
+                    return false, appName .. " copied an empty selection (restored your clipboard)"
+                end
+                log(string.format("copy produced nothing  app=%s", appName))
+                return false, appName .. " copied nothing"
+            end
+            log(string.format("copy landed after %dms  app=%s", waited, appName))
+            return true, nil
+        end
     end
-    return false
+
+    local reason
+    if not acc          then reason = "Hammerspoon has no Accessibility permission"
+    elseif not released then reason = "hotkey modifiers still held"
+    else                     reason = appName .. " ignored Cmd+C" end
+    log(string.format("copy FAILED after %dms  app=%s accessibility=%s modsReleased=%s reason=%s",
+        maxMs, appName, tostring(acc), tostring(released), reason))
+    return false, reason
 end
 
 -- Build an scp remote source spec from a Windows path. macOS scp runs a remote
@@ -363,12 +423,14 @@ end
 -- === Direction 2: Mac -> LOCAL (push) ======================================
 -- Suffix for push tips. When the Cmd+C never registered we are shipping whatever
 -- was already on the pasteboard, which may not be what the user just selected.
-local function staleSuffix(fresh)
-    if fresh == false then return " (existing clipboard - Cmd+C didn't register)" end
+local function staleSuffix(fresh, why)
+    if fresh == false then
+        return " (EXISTING clipboard - " .. (why or "Cmd+C didn't register") .. ")"
+    end
     return ""
 end
 
-local function pushText(text, fresh)
+local function pushText(text, fresh, why)
     local tmp = "/tmp/clipsync_pushtext_" .. nextSeq() .. ".txt"
     local f = io.open(tmp, "w"); f:write(text); f:close()
     local res = sshPost(tmp, "/text")
@@ -376,7 +438,7 @@ local function pushText(text, fresh)
     if res.exit ~= 0 or not responseOk(res) then
         tip("Push text failed: " .. trim(res.stderr) .. " " .. trim(res.stdout), true); return
     end
-    tip("Pushed " .. #text .. " chars to LOCAL." .. staleSuffix(fresh))
+    tip("Pushed " .. #text .. " chars to LOCAL." .. staleSuffix(fresh, why))
 end
 
 local function pushFiles(paths)
@@ -416,7 +478,7 @@ local function pushFiles(paths)
     tip("Pushed " .. ok .. " item(s) to LOCAL" .. (fail > 0 and (" (" .. fail .. " failed)") or "") .. ".")
 end
 
-local function pushImage(fresh)
+local function pushImage(fresh, why)
     -- Save the Mac pasteboard image to a temp PNG.
     local img = hs.pasteboard.readImage()
     if not img then tip("No image on the Mac clipboard.", true); return end
@@ -441,7 +503,7 @@ local function pushImage(fresh)
     if res.exit ~= 0 or not responseOk(res) then
         tip("POST /image failed: " .. trim(res.stderr) .. " " .. trim(res.stdout), true); return
     end
-    tip("Pushed image to LOCAL." .. staleSuffix(fresh))
+    tip("Pushed image to LOCAL." .. staleSuffix(fresh, why))
 end
 
 function M.pushToLocal()
@@ -451,16 +513,15 @@ function M.pushToLocal()
         if #sel > 0 then pushFiles(sel); return end
     end
     -- Otherwise copy the current selection and inspect the pasteboard.
-    -- Wait for the hotkey modifiers to release first, else Cmd+C merges with the
-    -- still-held Ctrl+Alt+Cmd and no copy happens (we'd push stale clipboard).
-    waitModifiersReleased(600)
-    local fresh = copyAndWait(1500)
+    -- copyAndWait handles the modifier wait, the Cmd+C, and confirming the
+    -- pasteboard actually changed; `fresh` is false when it didn't.
+    local fresh, why = copyAndWait(1500)
     if hs.pasteboard.readImage() ~= nil then
-        pushImage(fresh); return
+        pushImage(fresh, why); return
     end
     local text = hs.pasteboard.readString()
     if text and #text > 0 then
-        pushText(text, fresh); return
+        pushText(text, fresh, why); return
     end
     tip("Nothing to push (no Finder selection, image, or text).", true)
 end
