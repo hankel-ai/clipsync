@@ -215,12 +215,25 @@ What it does (user-scope, no elevation):
 
 ### Step 2b - on a macOS REMOTE
 
-Copy the `clipsync` folder to the Mac, then:
+Get the repo onto the Mac. `install-mac.sh` is stored in git with its executable
+bit set (mode `100755`), so a **clone** — or an `scp`, which preserves mode —
+lands it ready to run, no `chmod` needed:
 
 ```
-chmod +x install-mac.sh
+git clone https://github.com/hankel-ai/clipsync.git
+cd clipsync
 ./install-mac.sh --local-host 192.168.1.50
 ```
+
+> **Downloading the single file instead?** A raw `curl` of a GitHub file cannot
+> carry a Unix mode bit — HTTP has no concept of one, so it always lands `644`
+> no matter what the repo stores. Invoke the interpreter explicitly rather than
+> relying on the bit:
+>
+> ```
+> curl -fsSLO https://raw.githubusercontent.com/hankel-ai/clipsync/main/install-mac.sh
+> bash install-mac.sh --local-host 192.168.1.50
+> ```
 
 What it does (user-scope, no admin):
 

@@ -104,6 +104,8 @@ On Windows the clipboard is **per-window-station**. SSH-launched processes land 
 
 ## Gotchas to remember
 
+- **`install-mac.sh` must stay mode `100755` in the index, and `core.filemode` is `false` here.** The repo is authored on Windows, where git ignores worktree permission bits entirely — so `chmod +x` in the working copy is a no-op and the file was committed `100644`, forcing a manual `chmod +x` on every Mac. Fixed with `git update-index --chmod=+x install-mac.sh` (the *only* way to set it from Windows; a plain `git add` won't). Verify with `git ls-files -s install-mac.sh`, not `ls -l`. `.gitattributes` pins `*.sh` to `eol=lf` so a clone on a machine with `core.autocrlf=true` can't append a CR to the shebang (→ `bad interpreter: bash^M`). Caveat: a raw `curl` of a GitHub file **cannot** carry the bit — HTTP has no mode concept, so that path always lands `644` and must be run as `bash install-mac.sh`.
+
 - PS 5.1 is STA by default; PS 7 is MTA. Bridge asserts STA on startup. Startup shortcut passes `-Sta` explicitly to be safe.
 - `[Windows.Forms.Clipboard]::SetFileDropList` requires a `StringCollection`, not a string array.
 - `$headers['content-length'] ?? 0` is PS 7-only; bridge uses `if ($headers.ContainsKey(...))` for 5.1 compat (per global CLAUDE.md).

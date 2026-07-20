@@ -1,0 +1,11 @@
+# The repo is authored on Windows but install-mac.sh has to RUN on macOS.
+# Force LF for shell scripts so a clone on a machine with core.autocrlf=true
+# can't check them out with CRLF (a CR after the shebang makes the kernel look
+# for an interpreter literally named "bash\r" -> "bad interpreter" at run time).
+*.sh text eol=lf
+
+# Windows-side scripts stay CRLF-safe.
+*.ps1 text
+*.ahk text
+*.cmd text eol=crlf
+*.bat text eol=crlf
