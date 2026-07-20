@@ -129,6 +129,27 @@ local function waitModifiersReleased(maxMs)
     end
 end
 
+-- Synthesize Cmd+C and wait (bounded) for the pasteboard to ACTUALLY change.
+-- A fixed sleep is not enough: if the focused app is slow to serve the copy (an
+-- image takes far longer than text) or ignores Cmd+C entirely, the pasteboard
+-- still holds the PREVIOUS payload - so a push would ship stale content while
+-- honestly reporting success. hs.pasteboard.changeCount() is the only reliable
+-- "the copy landed" signal macOS gives us. Returns true if it incremented.
+-- A false return is NOT fatal: the user may have deliberately copied before
+-- pressing the hotkey (the Windows REMOTE's only mode), so we still push - the
+-- caller just labels the tip so a stale push can never look like a fresh one.
+local function copyAndWait(maxMs)
+    local before = hs.pasteboard.changeCount()
+    sendCmd("c")
+    local waited = 0
+    while waited < maxMs do
+        hs.timer.usleep(25000)
+        waited = waited + 25
+        if hs.pasteboard.changeCount() ~= before then return true end
+    end
+    return false
+end
+
 -- Build an scp remote source spec from a Windows path. macOS scp runs a remote
 -- glob on the SOURCE and mangles backslashes, so a path that exists still errors
 -- "No such file or directory". Forward slashes resolve fine on the Windows
@@ -340,7 +361,14 @@ function M.pullFromLocal()
 end
 
 -- === Direction 2: Mac -> LOCAL (push) ======================================
-local function pushText(text)
+-- Suffix for push tips. When the Cmd+C never registered we are shipping whatever
+-- was already on the pasteboard, which may not be what the user just selected.
+local function staleSuffix(fresh)
+    if fresh == false then return " (existing clipboard - Cmd+C didn't register)" end
+    return ""
+end
+
+local function pushText(text, fresh)
     local tmp = "/tmp/clipsync_pushtext_" .. nextSeq() .. ".txt"
     local f = io.open(tmp, "w"); f:write(text); f:close()
     local res = sshPost(tmp, "/text")
@@ -348,7 +376,7 @@ local function pushText(text)
     if res.exit ~= 0 or not responseOk(res) then
         tip("Push text failed: " .. trim(res.stderr) .. " " .. trim(res.stdout), true); return
     end
-    tip("Pushed " .. #text .. " chars to LOCAL.")
+    tip("Pushed " .. #text .. " chars to LOCAL." .. staleSuffix(fresh))
 end
 
 local function pushFiles(paths)
@@ -388,7 +416,7 @@ local function pushFiles(paths)
     tip("Pushed " .. ok .. " item(s) to LOCAL" .. (fail > 0 and (" (" .. fail .. " failed)") or "") .. ".")
 end
 
-local function pushImage()
+local function pushImage(fresh)
     -- Save the Mac pasteboard image to a temp PNG.
     local img = hs.pasteboard.readImage()
     if not img then tip("No image on the Mac clipboard.", true); return end
@@ -413,7 +441,7 @@ local function pushImage()
     if res.exit ~= 0 or not responseOk(res) then
         tip("POST /image failed: " .. trim(res.stderr) .. " " .. trim(res.stdout), true); return
     end
-    tip("Pushed image to LOCAL.")
+    tip("Pushed image to LOCAL." .. staleSuffix(fresh))
 end
 
 function M.pushToLocal()
@@ -426,14 +454,13 @@ function M.pushToLocal()
     -- Wait for the hotkey modifiers to release first, else Cmd+C merges with the
     -- still-held Ctrl+Alt+Cmd and no copy happens (we'd push stale clipboard).
     waitModifiersReleased(600)
-    sendCmd("c")
-    hs.timer.usleep(300000)
+    local fresh = copyAndWait(1500)
     if hs.pasteboard.readImage() ~= nil then
-        pushImage(); return
+        pushImage(fresh); return
     end
     local text = hs.pasteboard.readString()
     if text and #text > 0 then
-        pushText(text); return
+        pushText(text, fresh); return
     end
     tip("Nothing to push (no Finder selection, image, or text).", true)
 end
