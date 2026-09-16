@@ -54,7 +54,49 @@ clipsync-bridge.ps1                         clipsync.ahk
         '---------------------------------------'
 ```
 
+An iPhone is a third kind of REMOTE. It cannot `ssh` + `curl` the loopback the way the
+others do, so it talks to a second listener in the same bridge process:
+
+```
+LOCAL                                       REMOTE (iOS)
+-----                                       ------------
+clipsync-bridge.ps1                         Shortcuts app
+  - also listens on 0.0.0.0:8787              - Get Contents of URL
+  - requires an X-Token header                  POST http://<host>:8787/image
+  - body IS the payload (no scp)                X-Token: <token>
+        ^                                       |
+        | (tailnet or LAN)                      |
+        '---------------------------------------'
+```
+
 Why a bridge on LOCAL? On Windows the clipboard is **per-window-station**. SSH-launched processes land in a non-interactive window station, so they can't see the desktop clipboard. The bridge runs in your logon session, so it can — and the SSH session on LOCAL just dials its own loopback to reach it.
+
+## iPhone setup
+
+The bridge generates a token on first start. Read it once:
+
+```powershell
+Get-Content "$env:LOCALAPPDATA\clipsync\ios-token.txt"
+```
+
+Build a shortcut with three actions:
+
+| # | Action | Configuration |
+|---|---|---|
+| 1 | Get Clipboard | |
+| 2 | Get Contents of URL | `http://<host>:8787/clip`, Method **POST**, Request Body **File** = `Clipboard`, header `X-Token` = the token |
+| 3 | Show Result | `Contents of URL` |
+
+No type branching and no `Detect Images` - `/clip` sniffs the body and decides. `<host>` is
+the LOCAL machine's tailnet address when you are away, or its LAN address at home.
+
+The reply is **just the saved file's path on LOCAL**, e.g.
+`C:\clipsync-share\incoming\ios_20260916-191403.png`. Add a **Copy to Clipboard** action
+after Show Result and the path is on the phone's clipboard, ready to paste into Claude Code
+as a file reference. The image is also on LOCAL's clipboard, so you can just paste it there
+instead.
+
+iPhone photos are HEIC; they are transcoded to PNG on arrival so the path is openable.
 
 ## Setup at a glance
 

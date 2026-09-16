@@ -88,9 +88,54 @@ On Windows the clipboard is **per-window-station**. SSH-launched processes land 
 - `GET /image` &rarr; saves clipboard image as PNG under `C:\clipsync-share\outgoing\img_<ticks>.png`, returns the absolute LOCAL path (REMOTE scp's it down)
 - `POST /image` &rarr; body is a LOCAL absolute path to a PNG under the share the caller has scp'd up; bridge loads it via `[Drawing.Image]::FromFile`, calls `SetImage`, deletes the file
 
+## iOS listener (second listener, same process)
+
+The same `clipsync-bridge.ps1` process opens a **second** TcpListener, default
+`0.0.0.0:8787`, for REMOTEs that cannot use the ssh+curl transport. Routes are
+deliberately few and the body is the payload itself, not a share path:
+
+- `GET  /ping`  &rarr; `pong`
+- `POST /text`  &rarr; body is UTF-8 text; sets the clipboard and saves it as
+  `ios_<stamp>.txt`. Empty body clears the clipboard and returns `clipboard cleared`.
+  A body starting `{\rtf` is converted to plain text first (see below).
+- `POST /image` &rarr; body is the **raw image bytes**; sets the clipboard and saves the
+  image as `ios_<stamp>.png`.
+- `POST /clip`  &rarr; **the one the shortcut uses.** Sniffs the body's magic number
+  (`Test-ImageBytes`: PNG, JPEG, GIF, BMP, TIFF, `RIFF....WEBP`, and the ISO-BMFF `ftyp`
+  family for HEIC/HEIF/AVIF) and routes to the image path or the text path accordingly.
+  Empty body clears.
+
+Both image routes go through `Set-ClipboardImageBytes` -> `Get-DecodedImage`, which tries
+three decoders in order and reports all three failures if none works:
+
+1. **GDI+** (`[Drawing.Image]::FromFile`) - PNG, JPEG, GIF, BMP, TIFF.
+2. **WIC** (`[Windows.Media.Imaging.BitmapDecoder]`) - adds whatever Store codec extensions
+   are installed, re-encoded to PNG.
+3. **ffmpeg** - resolved from PATH once at startup, logged as `ffmpeg decoder:` on start.
+   Optional; if absent, HEIC just fails with a clear message.
+
+Every request needs an `X-Token` header matching
+`%LOCALAPPDATA%\clipsync\ios-token.txt`, which is generated on first start if
+absent. Anything else returns `403 ERROR: bad or missing X-Token`, checked
+**before** the body is read. `-IosPort 0` disables the listener entirely.
+
+**Every successful response body is the saved file's absolute Windows path and nothing
+else** - `C:\clipsync-share\incoming\ios_20260916-191403.png`. The iOS shortcut shows it
+and copies it to the phone's clipboard, so it can be pasted straight into Claude Code as a
+file reference. Errors are the only responses that are prose, and they all begin `ERROR:`.
+
+Unlike the scp-based `POST /image`, the iOS routes **keep** what they write - the path
+would be useless otherwise. The bridge's existing >7-day prune of the share on startup is
+what bounds the growth.
+
 ## Key design decisions
 
 - **Why not HttpListener**: needs URL-ACL reservation for non-default prefixes; reservation requires admin. TcpListener with hand-rolled HTTP avoids that.
+- **Why iOS gets its own listener instead of the ssh+curl transport**: Shortcuts has no scp, so it cannot stage a payload in the share; and its SSH action (NMSSH) does **not** reliably close stdin, so a remote script that blocks on stdin never returns. Measured ~1 success in 9 over a high-latency path, and every failure leaked an orphaned `powershell.exe` under `sshd.exe`. HTTP with `Content-Length` has neither problem. See the gotcha below.
+- **Why the iOS listener carries the bytes, not a share path**: the whole reason the other REMOTEs pass paths is that `scp` already moved the bytes. Shortcuts cannot, so the HTTP body *is* the transport. The bridge still stages through the share so the image path is identical to every other image payload.
+- **Why the bridge sniffs the type instead of the shortcut choosing an endpoint**: Shortcuts has no clean "is this clipboard item an image" test, and the `Detect Images` action is not reliably findable across iOS versions. A shortcut that must branch on type is fragile; one that POSTs the clipboard at `/clip` and lets the server decide is three actions with no branching. `/image` and `/text` remain for callers that already know.
+- **Why a token on the iOS listener**: it is not loopback-only, so the "no auth needed" argument that covers `127.0.0.1:8765` does not apply here.
+- **Why `0.0.0.0` and not the tailnet IP**: binding a Tailscale address at logon races the interface coming up and the bind fails. The cost is that it also listens on the LAN, so the token is the only thing protecting it.
 - **Why bind 127.0.0.1 only**: bridge is reachable only via SSH-session loopback. Zero LAN exposure, no auth needed.
 - **Why -EncodedCommand for SSH PowerShell calls** (`SshPs` in clipsync.ahk): cmd + ssh + remote-cmd quoting layers were corrupting characters like `|`, `(`, `;`. UTF-16 base64 is opaque to all of them.
 - **Why scp for file payloads, bridge only for clipboard**: scp uses sftp-server which works regardless of session, has built-in recursion, and would be silly to reinvent in PS.
@@ -120,6 +165,19 @@ On Windows the clipboard is **per-window-station**. SSH-launched processes land 
 - **Blank-password accounts can't do network logon**: `clipsync` gets a random password (not `-NoPassword`), else the default "limit blank-password use to console" policy blocks SSH.
 - **DefaultShell is machine-wide**: `HKLM:\SOFTWARE\OpenSSH\DefaultShell` applies to all SSH logins, so `clipsync` inherits PowerShell and `curl.exe`/`-EncodedCommand` work the same as for `admin`.
 - **macOS remote command quoting**: `clipsync.lua` passes the whole remote command as one sh-quoted arg to `ssh`.
+- **iOS Shortcuts' Run Script Over SSH cannot be used as a transport at all.** NMSSH, the library behind it, does not reliably send stdin EOF after writing the action's Input, so a remote `[Console]::In.ReadToEnd()` blocks until the client times out and tears down the channel - which is the only thing that ever delivers EOF. It is a race, not a network fault: low latency usually wins, high latency almost always loses, so the same shortcut "works on WiFi" and "fails on cellular" while routing, MTU and PTY are all fine. Two traps hide the cause: the file often **does** get written *after* the shortcut already reported an error (the timeout teardown finally delivers EOF), and every failed run leaks an orphaned `powershell.exe` under `sshd.exe` that nothing reaps - and reaping needs elevation, because a non-elevated admin `Stop-Process` reports success and does nothing. Sentinel-terminated reads do not rescue it either: `[Console]::In.ReadLine()` needs a trailing newline Shortcuts does not send, and `[Console]::In.Read(char[],int,int)` blocks until it *fills* the buffer, so both fail depending on where the payload ends relative to a boundary.
+- **GDI+ cannot decode HEIC, WebP or AVIF, and says "Out of memory" when it fails.** `[Drawing.Image]::FromFile` reports *every* unsupported format as `Exception calling "FromFile" with "1" argument(s): "Out of memory."`, which reads like resource exhaustion and is not. An iPhone posting anything the camera produced hits this immediately.
+- **`Microsoft.HEIFImageExtension` alone does NOT decode an iPhone HEIC.** The extension handles the HEIF *container*; the image data inside is HEVC-coded and needs `Microsoft.HEVCVideoExtension` as well, which is a paid Store item and is not installed here. Without it WIC fails with `No suitable transform was found to encode or decode the content. (Exception from HRESULT: 0xC00D5212)` - which looks like a missing HEIF codec and is not. This is why tier 3 exists: ffmpeg decodes HEIC with no Store extension at all. Verified on a real iPhone screenshot: GDI+ and WIC both failed, ffmpeg produced 1178x2556.
+- **`ffprobe` on a HEIC reports the thumbnail stream.** It said `hevc,512,512` for a file whose primary image is 1178x2556. Do not size-check a HEIC from ffprobe's first stream.
+- **Shelling out to ffmpeg needs `$ErrorActionPreference` dropped to `Continue`.** The script runs under `Stop`, where a native exe writing to stderr throws before `$LASTEXITCODE` is ever set. `Get-DecodedImage` saves and restores the preference around the call.
+- **When every decoder fails**, the payload is kept as `ios_<stamp>.bin` and its first 16 magic bytes are logged, rather than deleted - so an unknown format is diagnosable from the log alone.
+- **`Image.FromFile` locks the file until `Dispose`.** This bit once as a silent failed delete, and would bite again on the overwrite that re-encodes a HEIC to PNG in place. Every tier of `Get-DecodedImage` now returns a standalone `Bitmap` via `Copy-ToStandaloneBitmap`, so no caller ever holds a lock on the staged file.
+- **A `.png` name must not hold HEIC bytes.** The staged file is named `.png` before the format is known. If the upload was not already PNG, the decoded image is saved back over it so the extension is truthful - otherwise the returned path points at a file that Claude Code, editors and previewers all refuse to open. `Test-PngBytes` skips the re-encode when the upload was PNG to begin with, which also preserves the original bytes exactly.
+- **WebP's magic number is not at offset 0.** It is `RIFF` at 0 *and* `WEBP` at 8; checking only the first four bytes matches every RIFF container (WAV, AVI). A sniff that misses WebP silently routes the image down the text path and pastes binary garbage.
+- **iOS sends RTF, not plain text, when you copy from a browser.** The pasteboard holds several representations at once and Shortcuts hands over the richest, so `Get Clipboard` on copied web text yields a `public.rtf` document - the body arrives as `{\rtf1\ansi\ansicpg1252\cocoartf2907...` and pastes as markup. `Set-ClipboardTextBytes` detects the `{\rtf` prefix and runs it through `ConvertFrom-Rtf`, which uses a `RichTextBox` - the only RTF reader in the box, and it needs STA, which the bridge already asserts. Verified on a real Safari copy: 1767 chars of RTF to 322 chars of text with bullets, arrows, em dashes, degree signs and emoji all intact. Conversion failure is non-fatal: it logs and keeps the raw body.
+- **The iOS listener must answer `Expect: 100-continue`.** curl and several HTTP clients withhold a large body until they see it, so a hand-rolled server that ignores the header hangs on bodies over ~1KB. The bridge writes `HTTP/1.1 100 Continue` before calling `Read-Body`.
+- **Never trust a short body.** `Read-Body` returns what it got when the stream ends early, so a truncated upload would otherwise be written out as a valid-looking but corrupt image. The iOS routes compare `$bodyBytes.Length` against `Content-Length` and return 400 on a mismatch.
+- **Connection handling is synchronous on the STA message-pump thread.** A slow iOS upload blocks the loopback listener for the duration (`ReceiveTimeout` is 120s on the iOS listener, 10s on loopback). Same tradeoff `GET /files` already makes with its 120s staging budget.
 - **Do NOT pipe POST bodies over ssh stdin to a PowerShell-hosted curl.** `ssh host "curl.exe --data-binary '@-'" < file` delivers an EMPTY body when LOCAL's default shell is PowerShell — the ssh channel's stdin isn't wired through to the child curl.exe. `POST /text` then *clears* the clipboard but the bridge still returns `ok`, so the push falsely reports success (symptom: "Pushed N chars" but nothing pastes). Fix (matches `clipsync.ahk`'s `ScpThenPost`): `scp` the body file up to `C:\clipsync-share\incoming\clipsync_body_*.bin`, then `curl.exe --data-binary '@<that path>'` reads it as a FILE, then delete it. Verified on LOCAL: a `@file` POST sets the clipboard (metachars intact); an empty-stdin POST clears it and returns `ok`.
 - **`clipsync.lua` runs remote PowerShell via `-EncodedCommand` (base64 of UTF-16LE), NOT `powershell -Command "..."`.** A nested `-Command "..."` with double-quotes collides with how sshd wraps the command for the PowerShell default shell → the inner command breaks (observed: `Remove-Item` cleanup exited 2, leaving body files behind; `New-Item` staging-dir creation would fail the same way). Same rationale as `clipsync.ahk`'s `SshPs`. The Lua has a dependency-free `base64()` + a UTF-16LE encoder; verified byte-identical to `[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes(...))`. Only used for ASCII commands (staging paths are ASCII), so 1 zero-high-byte per char is a valid UTF-16LE.
 

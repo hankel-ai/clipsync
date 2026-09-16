@@ -35,7 +35,16 @@
 param(
     [string]$Bind = '127.0.0.1',
     [int]$Port = 8765,
-    [string]$ShareDir = 'C:\clipsync-share'
+    [string]$ShareDir = 'C:\clipsync-share',
+    # Second listener for REMOTEs that cannot ssh+curl the loopback bridge.
+    # iOS Shortcuts has no scp, and its SSH action does not reliably close
+    # stdin, so the ssh+curl transport the other REMOTEs use is unavailable.
+    # Token-authenticated because this listener is NOT loopback-only.
+    # -IosPort 0 disables it entirely.
+    [string]$IosBind = '0.0.0.0',
+    [int]$IosPort = 8787,
+    [int]$IosMaxBytes = 67108864,
+    [string]$IosTokenFile = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -47,6 +56,10 @@ if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+# WIC decoders (PresentationCore). GDI+ cannot read HEIC/HEIF/AVIF/WebP even
+# when the Store codec extensions are installed; WIC can. Used as a fallback.
+Add-Type -AssemblyName PresentationCore
+Add-Type -AssemblyName WindowsBase
 
 $script:logDir  = Join-Path $env:LOCALAPPDATA 'clipsync'
 if (-not (Test-Path $script:logDir)) { New-Item -ItemType Directory -Force -Path $script:logDir | Out-Null }
@@ -94,6 +107,180 @@ function Read-Body($stream, [int]$length) {
     }
     if ($read -lt $length) { $buf = $buf[0..($read-1)] }
     return $buf
+}
+
+function Copy-ToStandaloneBitmap($img) {
+    # Image.FromFile locks the file and Image.FromStream keeps a reference to
+    # the stream; a Bitmap copy owns neither.
+    try { return (New-Object Drawing.Bitmap $img) } finally { $img.Dispose() }
+}
+
+function Get-DecodedImage([string]$path) {
+    $why = @()
+
+    # Tier 1 - GDI+. Handles PNG, JPEG, GIF, BMP, TIFF.
+    # Copied into a standalone Bitmap so the caller never holds a lock on the
+    # staged file and can rewrite or delete it freely.
+    try {
+        return (Copy-ToStandaloneBitmap ([Drawing.Image]::FromFile($path)))
+    } catch {
+        # GDI+ reports every unsupported format as "Out of memory", so this is
+        # the normal path for a HEIC or WebP, not an error condition.
+        $why += "GDI+: $($_.Exception.Message)"
+    }
+
+    # Tier 2 - WIC. Adds whatever Store codec extensions are installed (WebP,
+    # RAW, and HEIF *if* the HEVC Video Extension is also present).
+    $fs = $null
+    $ms = $null
+    try {
+        $fs = [IO.File]::OpenRead($path)
+        $ms = New-Object IO.MemoryStream
+        $dec = [Windows.Media.Imaging.BitmapDecoder]::Create(
+            $fs,
+            [Windows.Media.Imaging.BitmapCreateOptions]::PreservePixelFormat,
+            [Windows.Media.Imaging.BitmapCacheOption]::OnLoad)
+        $enc = New-Object Windows.Media.Imaging.PngBitmapEncoder
+        $enc.Frames.Add([Windows.Media.Imaging.BitmapFrame]::Create($dec.Frames[0]))
+        $enc.Save($ms)
+        $ms.Position = 0
+        return (Copy-ToStandaloneBitmap ([Drawing.Image]::FromStream($ms)))
+    } catch {
+        $why += "WIC: $($_.Exception.Message)"
+    } finally {
+        if ($ms) { $ms.Dispose() }
+        if ($fs) { $fs.Dispose() }
+    }
+
+    # Tier 3 - ffmpeg. Decodes HEIC/AVIF without any paid Store extension.
+    if ($script:ffmpegPath) {
+        $tmp = "$path.decoded.png"
+        try {
+            # $ErrorActionPreference is 'Stop' for this script, and a native exe
+            # writing to stderr THROWS under Stop before $LASTEXITCODE is set.
+            $prevEap = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+                & $script:ffmpegPath -y -v error -i $path -frames:v 1 $tmp 2>&1 | Out-Null
+            } finally {
+                $ErrorActionPreference = $prevEap
+            }
+            if (Test-Path -LiteralPath $tmp) {
+                return (Copy-ToStandaloneBitmap ([Drawing.Image]::FromFile($tmp)))
+            }
+            $why += "ffmpeg: produced no output"
+        } catch {
+            $why += "ffmpeg: $($_.Exception.Message)"
+        } finally {
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        }
+    } else {
+        $why += 'ffmpeg: not on PATH'
+    }
+
+    throw ($why -join ' | ')
+}
+
+function Set-ClipboardImageBytes([byte[]]$bytes) {
+    # Stage into the share like every other image payload, decode, then delete.
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $png = Join-Path $script:shareIncoming "ios_$stamp.png"
+    $k = 1
+    while (Test-Path -LiteralPath $png) {
+        $png = Join-Path $script:shareIncoming "ios_$stamp-$k.png"
+        $k++
+    }
+    [IO.File]::WriteAllBytes($png, $bytes)
+    $img = $null
+    try {
+        $img = Get-DecodedImage $png
+        [Windows.Forms.Clipboard]::SetImage($img)
+        # The file is kept, not deleted: the response is its path, so that
+        # whatever reads it (Claude Code, an editor) can open it later. If the
+        # upload was not already PNG - an iPhone HEIC, a WebP - overwrite the
+        # staged bytes with the decoded PNG so the .png name is truthful and
+        # the file is readable by things that cannot decode HEIC.
+        if (-not (Test-PngBytes $bytes)) {
+            $img.Save($png, [Drawing.Imaging.ImageFormat]::Png)
+        }
+        return $png
+    } catch {
+        # Keep the payload rather than deleting evidence of a format we cannot read.
+        $kept = [IO.Path]::ChangeExtension($png, '.bin')
+        Move-Item -LiteralPath $png -Destination $kept -Force -ErrorAction SilentlyContinue
+        $n = [Math]::Min(15, $bytes.Length - 1)
+        $hex = (($bytes[0..$n]) | ForEach-Object { $_.ToString('x2') }) -join ' '
+        Log "IOS image decode FAILED $($bytes.Length)B magic=[$hex] kept=$kept : $($_.Exception.Message)"
+        throw "ERROR: could not decode image ($($bytes.Length) bytes, magic $hex) - kept at $kept"
+    } finally {
+        if ($img) { $img.Dispose() }
+    }
+}
+
+function ConvertFrom-Rtf([string]$rtf) {
+    # RichTextBox is the only RTF reader in the box. It needs STA, which the
+    # bridge already asserts on startup.
+    $rtb = New-Object Windows.Forms.RichTextBox
+    try {
+        $rtb.Rtf = $rtf
+        return $rtb.Text
+    } finally {
+        $rtb.Dispose()
+    }
+}
+
+function Set-ClipboardTextBytes([string]$text) {
+    # iOS carries several clipboard representations at once. Copying from a
+    # browser makes public.rtf the richest one, and that is what Shortcuts
+    # hands over - so the body arrives as an RTF document, not the text.
+    if ($text.TrimStart().StartsWith('{\rtf')) {
+        try {
+            $plain = ConvertFrom-Rtf $text
+            Log "converted RTF body: $($text.Length) -> $($plain.Length) chars"
+            $text = $plain
+        } catch {
+            Log "RTF conversion failed, keeping raw: $($_.Exception.Message)"
+        }
+    }
+    [Windows.Forms.Clipboard]::SetText($text, [Windows.Forms.TextDataFormat]::UnicodeText)
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $txt = Join-Path $script:shareIncoming "ios_$stamp.txt"
+    $k = 1
+    while (Test-Path -LiteralPath $txt) {
+        $txt = Join-Path $script:shareIncoming "ios_$stamp-$k.txt"
+        $k++
+    }
+    # UTF8Encoding($false): no BOM, so the file reads cleanly everywhere.
+    [IO.File]::WriteAllText($txt, $text, (New-Object Text.UTF8Encoding $false))
+    return $txt
+}
+
+function Test-PngBytes([byte[]]$b) {
+    if ($b.Length -lt 8) { return $false }
+    return ($b[0] -eq 0x89 -and $b[1] -eq 0x50 -and $b[2] -eq 0x4E -and $b[3] -eq 0x47)
+}
+
+function Test-ImageBytes([byte[]]$b) {
+    # Sniff by magic number. Shortcuts sends whatever the clipboard held as a
+    # file body, so the bridge decides image-vs-text rather than the client.
+    if ($b.Length -lt 12) { return $false }
+    # PNG
+    if ($b[0] -eq 0x89 -and $b[1] -eq 0x50 -and $b[2] -eq 0x4E -and $b[3] -eq 0x47) { return $true }
+    # JPEG
+    if ($b[0] -eq 0xFF -and $b[1] -eq 0xD8 -and $b[2] -eq 0xFF) { return $true }
+    # GIF
+    if ($b[0] -eq 0x47 -and $b[1] -eq 0x49 -and $b[2] -eq 0x46 -and $b[3] -eq 0x38) { return $true }
+    # BMP
+    if ($b[0] -eq 0x42 -and $b[1] -eq 0x4D) { return $true }
+    # TIFF (II* / MM*)
+    if (($b[0] -eq 0x49 -and $b[1] -eq 0x49 -and $b[2] -eq 0x2A) -or
+        ($b[0] -eq 0x4D -and $b[1] -eq 0x4D -and $b[2] -eq 0x00)) { return $true }
+    # WebP: 'RIFF' <4 byte size> 'WEBP'
+    if ($b[0] -eq 0x52 -and $b[1] -eq 0x49 -and $b[2] -eq 0x46 -and $b[3] -eq 0x46 -and
+        $b[8] -eq 0x57 -and $b[9] -eq 0x45 -and $b[10] -eq 0x42 -and $b[11] -eq 0x50) { return $true }
+    # ISO-BMFF family: HEIC / HEIF / AVIF - 'ftyp' at offset 4
+    if ($b[4] -eq 0x66 -and $b[5] -eq 0x74 -and $b[6] -eq 0x79 -and $b[7] -eq 0x70) { return $true }
+    return $false
 }
 
 function Write-Response($stream, [string]$status, [string]$body) {
@@ -150,14 +337,21 @@ function New-SyncIcon {
 # ---------------------------------------------------------------------------
 # Request handler (called on the main STA thread via Forms.Timer)
 # ---------------------------------------------------------------------------
-function Handle-Connection {
+function Handle-Connection($listener, [bool]$IsIos = $false) {
     $client = $null
     $stream = $null
     try {
-        $client = $script:listener.AcceptTcpClient()
+        $client = $listener.AcceptTcpClient()
         $client.NoDelay = $true
-        $client.ReceiveTimeout = 10000
-        $client.SendTimeout    = 10000
+        # The iOS listener carries whole images over a phone uplink, which can
+        # be slow; the loopback listener never needs more than a moment.
+        if ($IsIos) {
+            $client.ReceiveTimeout = 120000
+            $client.SendTimeout    = 120000
+        } else {
+            $client.ReceiveTimeout = 10000
+            $client.SendTimeout    = 10000
+        }
         $stream = $client.GetStream()
 
         $reqLine = Read-Line $stream
@@ -173,16 +367,93 @@ function Handle-Connection {
                 $headers[$k] = $v
             }
         }
-        $cl = 0
-        if ($headers.ContainsKey('content-length')) { $cl = [int]$headers['content-length'] }
-        $bodyBytes = Read-Body $stream $cl
-        $bodyText = if ($bodyBytes.Length -gt 0) { [Text.Encoding]::UTF8.GetString($bodyBytes) } else { '' }
-
         $parts = $reqLine -split ' '
         $method = $parts[0].ToUpper()
         $path = if ($parts.Length -ge 2) { $parts[1] } else { '/' }
         $key = "$method $path"
-        Log "REQ $key  body=$($bodyBytes.Length)B"
+
+        # Reject before reading the body, so an unauthorised caller cannot make
+        # us buffer megabytes. The loopback listener stays unauthenticated.
+        if ($IsIos) {
+            $tok = ''
+            if ($headers.ContainsKey('x-token')) { $tok = $headers['x-token'] }
+            if ($tok -ne $script:iosToken) {
+                Log "IOS REJECT $key bad/missing token from $($client.Client.RemoteEndPoint)"
+                Write-Response $stream '403 Forbidden' 'ERROR: bad or missing X-Token'
+                return
+            }
+        }
+
+        $cl = 0
+        if ($headers.ContainsKey('content-length')) { $cl = [int]$headers['content-length'] }
+        if ($IsIos -and $cl -gt $script:iosMaxBytes) {
+            Log "IOS REJECT $key oversize $cl"
+            Write-Response $stream '413 Payload Too Large' "ERROR: body $cl exceeds $($script:iosMaxBytes) bytes"
+            return
+        }
+        # curl and some HTTP clients withhold a large body until they see this.
+        if ($headers.ContainsKey('expect') -and $headers['expect'] -match '100-continue') {
+            $cont = [Text.Encoding]::ASCII.GetBytes("HTTP/1.1 100 Continue`r`n`r`n")
+            $stream.Write($cont, 0, $cont.Length)
+            $stream.Flush()
+        }
+
+        $bodyBytes = Read-Body $stream $cl
+        $bodyText = if ($bodyBytes.Length -gt 0) { [Text.Encoding]::UTF8.GetString($bodyBytes) } else { '' }
+        Log "REQ $key  body=$($bodyBytes.Length)B ios=$IsIos"
+
+        if ($IsIos) {
+            # Read-Body returns short on a truncated upload; never treat a
+            # partial image as a good one.
+            if ($bodyBytes.Length -ne $cl) {
+                Log "IOS short body $($bodyBytes.Length) of $cl"
+                Write-Response $stream '400 Bad Request' "ERROR: short body $($bodyBytes.Length) of $cl"
+                return
+            }
+            switch ($key) {
+                'GET /ping' {
+                    Write-Response $stream '200 OK' 'pong'
+                }
+                'POST /image' {
+                    if ($bodyBytes.Length -eq 0) {
+                        Write-Response $stream '400 Bad Request' 'ERROR: empty body'
+                    } else {
+                        try {
+                            Write-Response $stream '200 OK' (Set-ClipboardImageBytes $bodyBytes)
+                        } catch {
+                            Write-Response $stream '400 Bad Request' "$($_.Exception.Message)"
+                        }
+                    }
+                }
+                'POST /text' {
+                    if ($bodyText.Length -eq 0) {
+                        [Windows.Forms.Clipboard]::Clear()
+                        Write-Response $stream '200 OK' 'clipboard cleared'
+                    } else {
+                        Write-Response $stream '200 OK' (Set-ClipboardTextBytes $bodyText)
+                    }
+                }
+                'POST /clip' {
+                    # One endpoint for a client that cannot branch on type.
+                    if ($bodyBytes.Length -eq 0) {
+                        [Windows.Forms.Clipboard]::Clear()
+                        Write-Response $stream '200 OK' 'clipboard cleared'
+                    } elseif (Test-ImageBytes $bodyBytes) {
+                        try {
+                            Write-Response $stream '200 OK' (Set-ClipboardImageBytes $bodyBytes)
+                        } catch {
+                            Write-Response $stream '400 Bad Request' "$($_.Exception.Message)"
+                        }
+                    } else {
+                        Write-Response $stream '200 OK' (Set-ClipboardTextBytes $bodyText)
+                    }
+                }
+                default {
+                    Write-Response $stream '404 Not Found' "no route $key"
+                }
+            }
+            return
+        }
 
         switch ($key) {
             'GET /ping' {
@@ -333,6 +604,47 @@ try {
 Log "listening on ${Bind}:${Port}  pid=$PID"
 
 # ---------------------------------------------------------------------------
+# iOS listener (token-authenticated, not loopback-only)
+# ---------------------------------------------------------------------------
+# Third-tier image decoder. Optional: absent just means HEIC/AVIF will fail
+# with a clear message instead of being decoded.
+$script:ffmpegPath = $null
+try {
+    $ff = Get-Command ffmpeg.exe -ErrorAction SilentlyContinue
+    if ($ff) { $script:ffmpegPath = $ff.Source }
+} catch { }
+Log "ffmpeg decoder: $(if ($script:ffmpegPath) { $script:ffmpegPath } else { 'NOT FOUND' })"
+
+$script:iosMaxBytes = $IosMaxBytes
+$script:iosToken    = ''
+$script:iosListener = $null
+if ($IosPort -gt 0) {
+    $tokenFile = $IosTokenFile
+    if (-not $tokenFile) { $tokenFile = Join-Path $script:logDir 'ios-token.txt' }
+    if (Test-Path -LiteralPath $tokenFile) {
+        $script:iosToken = ([IO.File]::ReadAllText($tokenFile)).Trim()
+    }
+    if (-not $script:iosToken) {
+        $rndBytes = New-Object byte[] 16
+        $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+        try { $rng.GetBytes($rndBytes) } finally { $rng.Dispose() }
+        $script:iosToken = ([BitConverter]::ToString($rndBytes) -replace '-', '').ToLower()
+        # UTF8Encoding($false): PS 5.1's Set-Content -Encoding UTF8 writes a BOM.
+        [IO.File]::WriteAllText($tokenFile, $script:iosToken, (New-Object Text.UTF8Encoding $false))
+        Log "generated iOS token -> $tokenFile"
+    }
+    $iosIp = [Net.IPAddress]::Parse($IosBind)
+    $script:iosListener = New-Object Net.Sockets.TcpListener($iosIp, $IosPort)
+    try {
+        $script:iosListener.Start()
+        Log "iOS listener on ${IosBind}:${IosPort}  token=$($script:iosToken.Substring(0,4))...  file=$tokenFile"
+    } catch {
+        Log "iOS listener bind FAILED ${IosBind}:${IosPort} - $($_.Exception.Message)"
+        $script:iosListener = $null
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Hidden form (message-pump owner)
 # ---------------------------------------------------------------------------
 $form = New-Object Windows.Forms.Form
@@ -386,6 +698,7 @@ $restartItem.Add_Click({
     Log "restart requested"
     $script:timer.Stop()
     $script:listener.Stop()
+    if ($script:iosListener) { $script:iosListener.Stop() }
     Start-Sleep -Milliseconds 300
     Start-Process -FilePath (Get-Command powershell.exe).Source -ArgumentList @(
         '-NoProfile', '-WindowStyle', 'Hidden',
@@ -405,6 +718,7 @@ $exitItem.Add_Click({
     Log "exit requested"
     $script:timer.Stop()
     $script:listener.Stop()
+    if ($script:iosListener) { $script:iosListener.Stop() }
     $script:notifyIcon.Visible = $false
     $script:notifyIcon.Dispose()
     [Windows.Forms.Application]::Exit()
@@ -419,7 +733,12 @@ $script:timer = New-Object Windows.Forms.Timer
 $script:timer.Interval = 50
 $script:timer.Add_Tick({
     while ($script:listener.Pending()) {
-        Handle-Connection
+        Handle-Connection $script:listener $false
+    }
+    if ($script:iosListener) {
+        while ($script:iosListener.Pending()) {
+            Handle-Connection $script:iosListener $true
+        }
     }
 })
 $script:timer.Start()
@@ -430,6 +749,7 @@ $script:timer.Start()
 $form.Add_FormClosing({
     $script:timer.Stop()
     $script:listener.Stop()
+    if ($script:iosListener) { $script:iosListener.Stop() }
     $script:notifyIcon.Visible = $false
     $script:notifyIcon.Dispose()
 })
