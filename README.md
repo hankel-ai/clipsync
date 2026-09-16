@@ -79,7 +79,8 @@ The bridge generates a token on first start. Read it once:
 Get-Content "$env:LOCALAPPDATA\clipsync\ios-token.txt"
 ```
 
-Build a shortcut with three actions:
+Full build instructions, field by field, plus the error table and troubleshooting:
+**[docs/ios-shortcut.md](docs/ios-shortcut.md)**. Short version - three actions:
 
 | # | Action | Configuration |
 |---|---|---|

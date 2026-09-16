@@ -90,6 +90,10 @@ On Windows the clipboard is **per-window-station**. SSH-launched processes land 
 
 ## iOS listener (second listener, same process)
 
+The phone-side build instructions live in `docs/ios-shortcut.md` - exact action names, field
+values, the response/error table and troubleshooting. Keep it in step with any route change
+here.
+
 The same `clipsync-bridge.ps1` process opens a **second** TcpListener, default
 `0.0.0.0:8787`, for REMOTEs that cannot use the ssh+curl transport. Routes are
 deliberately few and the body is the payload itself, not a share path:
